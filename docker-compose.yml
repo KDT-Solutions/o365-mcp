@@ -17,7 +17,7 @@ services:
       - ALL
     environment:
       # JSON with client_id, tenants and bearer clients (see config/tenants.example.json).
-      TENANTS_JSON: ${TENANTS_JSON:?Set TENANTS_JSON}
+      TENANTS_JSON: ${TENANTS_JSON}
       STATE_PATH: /data/state.db
       MCP_PATH: ${MCP_PATH:-/o365}
       ALLOWED_HOSTS: ${MCP_PUBLIC_HOST:-mcp.example.com},localhost:*,127.0.0.1:*

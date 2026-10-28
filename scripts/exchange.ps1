@@ -27,7 +27,8 @@ function Get-CalendarFolder($address, $path) {
         if ($path -notmatch '^/[^:\\]{1,250}$') { throw 'Invalid folder path' }
         $match = Get-EXOMailboxFolderStatistics -Identity $address -FolderScope Calendar | Where-Object { $_.FolderPath -eq $path } | Select-Object -First 1
         if (-not $match) { throw 'Calendar folder not found' }
-        return $address + ':' + ($path -replace '/', '\')
+        # Address the folder by its ID: path-based identities fail for some folders (e.g. outside the default calendar).
+        return $address + ':' + $match.FolderId
     }
     # The default calendar folder name is localized ("Kalender", "Calendar", ...), so look it up by type.
     $folder = Get-EXOMailboxFolderStatistics -Identity $address -FolderScope Calendar | Where-Object { $_.FolderType -eq 'Calendar' } | Select-Object -First 1

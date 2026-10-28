@@ -21,8 +21,13 @@ RUN chmod 0755 /app /app/scripts && chmod 0644 /app/scripts/exchange.ps1
 RUN --mount=type=secret,id=system_ca \
     if [ -f /run/secrets/system_ca ]; then export PIP_CERT=/run/secrets/system_ca; fi; \
     python3 -m pip install --no-cache-dir -r requirements.lock && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation .
+ARG APP_VERSION=dev
+ARG APP_COMMIT=unknown
+ARG APP_BUILD_DATE=unknown
+LABEL org.opencontainers.image.source=https://github.com/KDT-Solutions/o365-mcp
 USER 10001:10001
-ENV HOME=/home/mcp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENV HOME=/home/mcp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    APP_VERSION=${APP_VERSION} APP_COMMIT=${APP_COMMIT} APP_BUILD_DATE=${APP_BUILD_DATE}
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
 CMD ["m365-mcp"]

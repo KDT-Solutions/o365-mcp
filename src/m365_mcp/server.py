@@ -1,7 +1,9 @@
 import contextvars
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 import os
 from pathlib import Path
+import time
 import uuid
 
 from mcp.server.fastmcp import FastMCP
@@ -11,6 +13,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 import uvicorn
 
+from .certs import certificate_info, ensure_certificate
 from .core import Registry, Store
 from .providers import Exchange, Graph
 
@@ -35,17 +38,37 @@ class Authentication:
             actor.reset(marker)
 
 
+def load_registry(config_path=None):
+    if config_path is None and os.environ.get('TENANTS_JSON'):
+        return Registry(text=os.environ['TENANTS_JSON'])
+    return Registry(config_path or os.environ.get('CONFIG_PATH', '/config/tenants.json'))
+
+
+def version_info():
+    try:
+        current = os.environ.get('APP_VERSION') or package_version('m365-cloud-mcp')
+    except PackageNotFoundError:
+        current = 'unknown'
+    return {'name': 'o365-mcp', 'version': current, 'commit': os.environ.get('APP_COMMIT', 'unknown'),
+            'built': os.environ.get('APP_BUILD_DATE', 'unknown')}
+
+
 def create_app(config_path=None, state_path=None, graph=None, exchange=None):
-    registry = Registry(config_path or os.environ.get('CONFIG_PATH', '/config/tenants.json'))
+    registry = load_registry(config_path)
     state_path = state_path or os.environ.get('STATE_PATH', '/data/state.db')
     Path(state_path).parent.mkdir(parents=True, exist_ok=True)
-    store = Store(state_path)
-    pfx = os.environ.get('CERTIFICATE_PATH', '/run/secrets/m365.pfx')
-    password = os.environ.get('CERTIFICATE_PASSWORD_FILE', '/run/secrets/pfx_password')
+    store = Store(state_path, int(os.environ.get('AUDIT_RETENTION_DAYS', '365')))
+    pfx = os.environ.get('CERTIFICATE_PATH', '')
+    password = os.environ.get('CERTIFICATE_PASSWORD_FILE', '')
+    if not (pfx and Path(pfx).exists()):
+        pfx, password = ensure_certificate(os.environ.get('CERTIFICATE_DIR', str(Path(state_path).parent / 'certificate')))
     graph = graph or Graph(registry.client_id, pfx, password)
-    exchange = exchange or Exchange(registry.client_id, pfx, password, os.environ.get('EXCHANGE_SCRIPT', '/app/scripts/exchange.ps1'))
+    exchange = exchange or Exchange(registry.client_id, pfx, password, os.environ.get('EXCHANGE_SCRIPT', '/app/scripts/exchange.ps1'),
+                                    max_sessions=int(os.environ.get('EXCHANGE_MAX_SESSIONS', '2')),
+                                    idle_seconds=int(os.environ.get('EXCHANGE_IDLE_SECONDS', '600')))
     allowed_hosts = os.environ.get('ALLOWED_HOSTS', 'localhost:*,127.0.0.1:*').split(',')
     mcp = FastMCP('Microsoft 365 Customer Administration', stateless_http=True, json_response=True,
+                  streamable_http_path=os.environ.get('MCP_PATH', '/mcp'),
                   transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
                       allowed_hosts=allowed_hosts, allowed_origins=os.environ.get('ALLOWED_ORIGINS', '').split(',') if os.environ.get('ALLOWED_ORIGINS') else []))
 
@@ -55,14 +78,38 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
     async def read(alias, action, operation, target=''):
         tenant = authorize(alias)
         name = actor.get()['name']
-        store.audit(name, alias, action, target, 'started')
+        started = time.monotonic()
         try:
             result = await operation(tenant)
         except Exception:
-            store.audit(name, alias, action, target, 'failed')
+            store.audit(name, alias, action, target, 'failed', elapsed(started))
             raise RuntimeError('Provider operation failed. Check tenant permissions and service configuration.') from None
-        store.audit(name, alias, action, target, 'succeeded')
+        store.audit(name, alias, action, target, 'succeeded', elapsed(started))
         return result
+
+    def elapsed(started):
+        return int((time.monotonic() - started) * 1000)
+
+    @mcp.tool(annotations={'readOnlyHint': True, 'openWorldHint': False})
+    def get_version() -> dict:
+        """Version and build commit of this MCP server."""
+        return version_info()
+
+    @mcp.tool(annotations={'readOnlyHint': True, 'openWorldHint': False})
+    def get_app_certificate() -> dict:
+        """Public certificate of the Entra app (PEM, SHA-1 thumbprint, validity). Upload it in Entra under Certificates & secrets. The private key never leaves the server."""
+        info = certificate_info(pfx, password)
+        info['client_id_configured'] = registry.client_id is not None
+        return info
+
+    @mcp.tool(annotations={'readOnlyHint': True, 'openWorldHint': False})
+    def get_audit_log(tenant: str | None = None, action: str | None = None, hours: int | None = None, limit: int = 100) -> list[dict]:
+        """Read the audit log (newest first) for tenants this client may access. Optional filters: tenant alias, action, last N hours. limit 1-1000."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError('limit must be between 1 and 1000')
+        tenants = [authorize(tenant).alias] if tenant else list(actor.get()['tenants'])
+        since = time.time() - hours * 3600 if hours else None
+        return store.audit_log(tenants, limit, action, since)
 
     @mcp.tool(annotations={'readOnlyHint': True, 'openWorldHint': False})
     def list_tenants() -> list[dict]:
@@ -190,6 +237,7 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         name = actor.get()['name']
         action, target = store.claim(plan_id, name, tenant)
         store.audit(name, tenant, action, target, 'executing')
+        started = time.monotonic()
         try:
             if action == 'block_signin':
                 result = await graph.block(customer, target)
@@ -201,10 +249,10 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                 raise ValueError('Unsupported stored action')
         except BaseException:
             store.finish(plan_id, 'unknown')
-            store.audit(name, tenant, action, target, 'unknown_verify_remote_state')
+            store.audit(name, tenant, action, target, 'unknown_verify_remote_state', elapsed(started))
             raise RuntimeError('Execution did not complete cleanly. Plan is consumed. Check remote state before retrying.') from None
         store.finish(plan_id, 'succeeded')
-        store.audit(name, tenant, action, target, 'succeeded')
+        store.audit(name, tenant, action, target, 'succeeded', elapsed(started))
         return {'tenant': tenant, 'action': action, 'target': target, 'result': result}
 
     async def health(_):

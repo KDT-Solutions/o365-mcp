@@ -1,40 +1,49 @@
-# Portainer Git stack (Docker Standalone). Portainer clones this repository
-# and builds the image on the target Docker host from the Dockerfile.
+# Portainer Git stack (Docker Standalone). The image is built by GitHub Actions
+# on every push to main (.github/workflows/docker-publish.yml) and pulled from GHCR.
+# Configuration comes from stack environment variables; no host files are needed.
 services:
-  m365-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ${MCP_IMAGE:-m365-cloud-mcp:local}
-    pull_policy: build
+  o365-mcp:
+    image: ghcr.io/kdt-solutions/o365-mcp:${O365_MCP_TAG:-latest}
+    # Pull on every deploy/redeploy instead of reusing a stale local :latest.
+    pull_policy: always
+    container_name: o365-mcp-cloud
     restart: unless-stopped
     init: true
+    # Hardening: unprivileged user (see Dockerfile), read-only root filesystem,
+    # no Linux capabilities. security_opt is not set: Portainer rejects it for
+    # non-admin users, and this stack is deployed by the MCP user.
     read_only: true
-    security_opt:
-      - no-new-privileges:true
     cap_drop:
       - ALL
     environment:
-      CONFIG_PATH: /config/tenants.json
+      # JSON with client_id, tenants and bearer clients (see config/tenants.example.json).
+      TENANTS_JSON: ${TENANTS_JSON:?Set TENANTS_JSON}
       STATE_PATH: /data/state.db
-      CERTIFICATE_PATH: /run/secrets/m365.pfx
-      CERTIFICATE_PASSWORD_FILE: /run/secrets/pfx_password
-      ALLOWED_HOSTS: ${MCP_HOST:?Set MCP_HOST to your public DNS name},localhost:*,127.0.0.1:*
-      ALLOWED_ORIGINS: https://${MCP_HOST}
+      MCP_PATH: ${MCP_PATH:-/o365}
+      ALLOWED_HOSTS: ${MCP_PUBLIC_HOST:-mcp.example.com},localhost:*,127.0.0.1:*
+      ALLOWED_ORIGINS: https://${MCP_PUBLIC_HOST:-mcp.example.com}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      EXCHANGE_MAX_SESSIONS: ${EXCHANGE_MAX_SESSIONS:-2}
+      EXCHANGE_IDLE_SECONDS: ${EXCHANGE_IDLE_SECONDS:-600}
       HOME: /home/mcp
     ports:
-      - "127.0.0.1:${MCP_PORT:-8085}:8000"
+      # Access only through the reverse proxy with TLS. Set MCP_BIND_ADDR to
+      # the Docker host IP the proxy connects to; without it the service is
+      # only reachable on 127.0.0.1.
+      - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8437}:8000"
     volumes:
-      - ${MCP_CONFIG_DIR:?Set MCP_CONFIG_DIR}/tenants.json:/config/tenants.json:ro
-      - ${MCP_SECRET_DIR:?Set MCP_SECRET_DIR}/m365.pfx:/run/secrets/m365.pfx:ro
-      - ${MCP_SECRET_DIR}/pfx_password:/run/secrets/pfx_password:ro
-      - m365_data:/data
+      # SQLite state, audit log and the generated app certificate.
+      - data:/data
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m,uid=10001,gid=10001
       - /home/mcp:rw,nosuid,size=128m,uid=10001,gid=10001
-    mem_limit: 1g
-    cpus: 2
-    pids_limit: 128
+    mem_limit: 2g
+    pids_limit: 256
     stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 volumes:
-  m365_data:
+  data:

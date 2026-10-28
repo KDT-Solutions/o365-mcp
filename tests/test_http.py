@@ -92,6 +92,34 @@ def test_http_mcp_auth_acl_and_confirmation(config, tmp_path, monkeypatch):
                 changed = await tool('execute_plan', {'tenant': 'alpha', 'plan_id': group_id, 'confirmed': True})
                 assert not changed.get('isError'), changed
                 assert any(x[0] == 'remove_group_member' for x in provider.calls)
+                version = await tool('get_version', {})
+                assert 'commit' in version['content'][0]['text']
+                certificate = json.loads((await tool('get_app_certificate', {}))['content'][0]['text'])
+                assert certificate['pem'].startswith('-----BEGIN CERTIFICATE-----')
+                audit = await tool('get_audit_log', {})
+                assert not audit.get('isError'), audit
+                entries = audit['structuredContent']['result']
+                assert entries and {entry['tenant'] for entry in entries} == {'alpha'}
+                foreign = await tool('get_audit_log', {'tenant': 'beta'})
+                assert foreign.get('isError') is True
                 bad_host = await client.post('/mcp', headers={**headers, 'Host': 'attacker.example'}, json={})
                 assert bad_host.status_code == 421
+    asyncio.run(scenario())
+
+
+def test_custom_mcp_path(config, tmp_path, monkeypatch):
+    monkeypatch.setenv('ALLOWED_HOSTS', 'testserver')
+    monkeypatch.setenv('MCP_PATH', '/o365')
+    app = create_app(config, tmp_path / 'state.db', FakeGraph(), FakeExchange())
+
+    async def scenario():
+        async with app.app.router.lifespan_context(app.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver') as client:
+                headers = {'Authorization': 'Bearer test-token', 'Accept': 'application/json, text/event-stream'}
+                body = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                        'params': {'protocolVersion': '2025-03-26', 'capabilities': {}, 'clientInfo': {'name': 'test', 'version': '1'}}}
+                response = await client.post('/o365', headers=headers, json=body)
+                assert response.status_code == 200, response.text
+                assert 'serverInfo' in response.json()['result']
+                assert (await client.post('/mcp', headers=headers, json=body)).status_code == 404
     asyncio.run(scenario())

@@ -18,11 +18,12 @@ class Tenant:
 
 
 class Registry:
-    def __init__(self, path):
-        config = json.loads(Path(path).read_text())
-        self.client_id = str(uuid.UUID(config['client_id']))
+    def __init__(self, path=None, text=None):
+        config = json.loads(text if text is not None else Path(path).read_text())
+        # client_id may stay empty until the Entra app exists; Microsoft calls then fail closed.
+        self.client_id = str(uuid.UUID(config['client_id'])) if config.get('client_id') else None
         self.tenants = {}
-        for item in config['tenants']:
+        for item in config.get('tenants', []):
             tenant = Tenant(**item)
             uuid.UUID(tenant.tenant_id)
             if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', tenant.alias):
@@ -61,19 +62,57 @@ class Registry:
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, retention_days=365):
         self.path = path
+        self.retention = retention_days * 86400
+        self.purged = 0.0
         with self.connect() as db:
+            db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS plans (id TEXT PRIMARY KEY, actor TEXT, tenant TEXT, action TEXT, target TEXT, expires REAL, status TEXT)')
-            db.execute('CREATE TABLE IF NOT EXISTS audit (at REAL, actor TEXT, tenant TEXT, action TEXT, target TEXT, outcome TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS audit (at REAL, actor TEXT, tenant TEXT, action TEXT, target TEXT, outcome TEXT, duration_ms INTEGER)')
             db.execute('CREATE TABLE IF NOT EXISTS plan_payloads (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+            db.execute('CREATE INDEX IF NOT EXISTS audit_at ON audit (at)')
+            db.execute('CREATE INDEX IF NOT EXISTS audit_tenant_at ON audit (tenant, at)')
+        self.purge()
 
     def connect(self):
-        return sqlite3.connect(self.path, timeout=15)
+        db = sqlite3.connect(self.path, timeout=15)
+        db.execute('PRAGMA synchronous=NORMAL')
+        return db
 
-    def audit(self, actor, tenant, action, target, outcome):
+    def purge(self):
+        """Drop audit rows past retention and plans that expired more than a day ago."""
+        now = time.time()
         with self.connect() as db:
-            db.execute('INSERT INTO audit VALUES (?,?,?,?,?,?)', (time.time(), actor, tenant, action, target, outcome))
+            if self.retention > 0:
+                db.execute('DELETE FROM audit WHERE at < ?', (now - self.retention,))
+            db.execute('DELETE FROM plan_payloads WHERE id IN (SELECT id FROM plans WHERE expires < ?)', (now - 86400,))
+            db.execute('DELETE FROM plans WHERE expires < ?', (now - 86400,))
+        self.purged = now
+
+    def audit(self, actor, tenant, action, target, outcome, duration_ms=None):
+        if time.time() - self.purged > 3600:
+            self.purge()
+        with self.connect() as db:
+            db.execute('INSERT INTO audit VALUES (?,?,?,?,?,?,?)', (time.time(), actor, tenant, action, target, outcome, duration_ms))
+
+    def audit_log(self, tenants, limit=100, action=None, since=None):
+        if not tenants:
+            return []
+        query = f"SELECT at, actor, tenant, action, target, outcome, duration_ms FROM audit WHERE tenant IN ({','.join('?' * len(tenants))})"
+        args = list(tenants)
+        if action:
+            query += ' AND action = ?'
+            args.append(action)
+        if since is not None:
+            query += ' AND at >= ?'
+            args.append(since)
+        query += ' ORDER BY at DESC LIMIT ?'
+        args.append(limit)
+        with self.connect() as db:
+            rows = db.execute(query, args).fetchall()
+        keys = ('at', 'actor', 'tenant', 'action', 'target', 'outcome', 'duration_ms')
+        return [dict(zip(keys, row)) for row in rows]
 
     def plan(self, actor, tenant, action, target, payload=None):
         identifier = secrets.token_urlsafe(32)

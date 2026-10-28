@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
 
@@ -23,6 +24,8 @@ class Graph:
         self.apps = {}
 
     def token(self, tenant):
+        if not self.client_id:
+            raise RuntimeError('Entra app client_id is not configured')
         if tenant.tenant_id not in self.apps:
             self.apps[tenant.tenant_id] = msal.ConfidentialClientApplication(
                 self.client_id, authority=f'https://login.microsoftonline.com/{tenant.tenant_id}',
@@ -77,31 +80,131 @@ class Graph:
         raise ValueError('Unsupported Graph operation')
 
 
+MARKER = b'@@M365@@'
+
+
+class Session:
+    """One long-lived pwsh process connected to a single customer organization."""
+
+    def __init__(self, proc):
+        self.proc = proc
+        self.lock = asyncio.Lock()
+        self.users = 0
+        self.started = self.used = time.monotonic()
+
+    async def receive(self):
+        # Ignore anything the Exchange module prints itself; only marked lines are protocol.
+        while True:
+            line = await self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError('Exchange session ended unexpectedly')
+            if line.startswith(MARKER):
+                return json.loads(line[len(MARKER):])
+
+    async def close(self):
+        if self.proc.returncode is None:
+            try:
+                self.proc.stdin.close()
+                await asyncio.wait_for(self.proc.wait(), timeout=15)
+            except (TimeoutError, ConnectionError, OSError):
+                self.proc.kill()
+                await self.proc.wait()
+
+
 class Exchange:
-    def __init__(self, client_id, pfx_path, password_path, script):
+    """Reuses Exchange Online sessions per tenant instead of connecting for every call."""
+
+    def __init__(self, client_id, pfx_path, password_path, script, max_sessions=2, idle_seconds=600, max_age_seconds=2700):
         self.client_id, self.pfx_path, self.password_path, self.script = client_id, pfx_path, password_path, script
-        self.lock = asyncio.Semaphore(2)
+        self.max_sessions, self.idle_seconds, self.max_age_seconds = max_sessions, idle_seconds, max_age_seconds
+        self.slots = asyncio.Semaphore(max_sessions)
+        self.sessions = {}
+        self.pool = asyncio.Lock()
+        self.reaper = None
+
+    async def start(self, tenant):
+        proc = await asyncio.create_subprocess_exec('pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', self.script,
+                                                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.DEVNULL, limit=16 * 1024 * 1024)
+        session = Session(proc)
+        proc.stdin.write(json.dumps({'client_id': self.client_id, 'organization': tenant.organization,
+                                     'certificate': self.pfx_path, 'password_file': self.password_path}).encode() + b'\n')
+        try:
+            await proc.stdin.drain()
+            ready = await asyncio.wait_for(session.receive(), timeout=120)
+        except BaseException:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError('Exchange connection failed; verify consent, RBAC and certificate') from None
+        if not ready.get('ok'):
+            await session.close()
+            raise RuntimeError('Exchange connection failed; verify consent, RBAC and certificate')
+        return session
+
+    async def discard(self, key):
+        session = self.sessions.pop(key, None)
+        if session:
+            await session.close()
+
+    async def reap(self):
+        while True:
+            await asyncio.sleep(60)
+            now = time.monotonic()
+            async with self.pool:
+                for key, session in list(self.sessions.items()):
+                    if not session.users and (now - session.used > self.idle_seconds or now - session.started > self.max_age_seconds):
+                        await self.discard(key)
+
+    async def session(self, tenant):
+        key = tenant.tenant_id
+        current = self.sessions.get(key)
+        if current and (current.proc.returncode is not None or time.monotonic() - current.started > self.max_age_seconds) and not current.users:
+            await self.discard(key)
+            current = None
+        if current:
+            return current
+        idle = [k for k, s in self.sessions.items() if not s.users]
+        while len(self.sessions) >= self.max_sessions and idle:
+            oldest = min(idle, key=lambda k: self.sessions[k].used)
+            idle.remove(oldest)
+            await self.discard(oldest)
+        self.sessions[key] = await self.start(tenant)
+        return self.sessions[key]
 
     async def run(self, tenant, action, target=''):
         if action not in ('list_mailboxes', 'get_mailbox', 'convert_shared'):
             raise ValueError('Unsupported Exchange operation')
+        if not self.client_id:
+            raise RuntimeError('Entra app client_id is not configured')
         if target:
             target = str(uuid.UUID(target))
-        payload = json.dumps({'client_id': self.client_id, 'organization': tenant.organization,
-                              'certificate': self.pfx_path, 'password_file': self.password_path,
-                              'action': action, 'target': target}).encode()
-        async with self.lock:
-            proc = await asyncio.create_subprocess_exec('pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', self.script,
-                                                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        if self.reaper is None or self.reaper.done():
+            self.reaper = asyncio.create_task(self.reap())
+        async with self.slots:
+            async with self.pool:
+                session = await self.session(tenant)
+                session.users += 1
             try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(payload), timeout=180)
-            except (TimeoutError, asyncio.CancelledError):
-                proc.kill()
-                await proc.wait()
+                return await self.call(session, tenant, action, target)
+            finally:
+                session.users -= 1
+
+    async def call(self, session, tenant, action, target):
+        async with session.lock:
+            session.used = time.monotonic()
+            try:
+                session.proc.stdin.write(json.dumps({'action': action, 'target': target}).encode() + b'\n')
+                await session.proc.stdin.drain()
+                reply = await asyncio.wait_for(session.receive(), timeout=180)
+            except BaseException:
+                # State of the remote call is unknown; never reuse this process.
+                if session.proc.returncode is None:
+                    session.proc.kill()
+                    await session.proc.wait()
+                if self.sessions.get(tenant.tenant_id) is session:
+                    del self.sessions[tenant.tenant_id]
                 raise RuntimeError('Exchange execution interrupted; verify remote state before retrying') from None
-        if proc.returncode:
+            session.used = time.monotonic()
+        if not reply.get('ok'):
             raise RuntimeError('Exchange command failed; verify consent, RBAC and target. Remote state may have changed.')
-        try:
-            return json.loads(stdout)
-        except (ValueError, UnicodeDecodeError):
-            raise RuntimeError('Invalid Exchange response; verify remote state before retrying') from None
+        return reply.get('result')

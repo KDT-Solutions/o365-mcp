@@ -1,4 +1,4 @@
-# Microsoft 365 Cloud MCP für Portainer
+# o365-mcp – Microsoft 365 Cloud MCP
 
 Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft Graph und Exchange Online PowerShell. Eine mandantenfähige Entra-Anwendung authentifiziert sich per Zertifikat. Der jeweilige Kundenadmin erteilt die Zustimmung; spätere Aktionen laufen als Anwendung, nicht als dieser Benutzer.
 
@@ -19,6 +19,9 @@ Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft G
 | `prepare_license_change` | Plan zum Zuweisen/Entfernen direkter Benutzerlizenzen |
 | `prepare_group_membership` | Plan zum Hinzufügen/Entfernen eines Benutzers in einer statischen Cloud-Gruppe |
 | `execute_plan` | Einmalige Ausführung nach Bestätigung; Plan verfällt nach zehn Minuten |
+| `get_audit_log` | Audit-Log der freigegebenen Tenants, neueste zuerst; Filter nach Tenant, Aktion, Stunden |
+| `get_app_certificate` | Öffentliches App-Zertifikat (PEM, SHA-1-Fingerabdruck, Gültigkeit) für den Upload in Entra |
+| `get_version` | Version und Build-Commit |
 
 Keine Benutzeranlage/-löschung, vollständige On-/Offboarding-Automatik, Teams-Telefonie oder frei ausführbaren Graph-/PowerShell-Kommandos. Lizenzänderungen beziehen sich auf direkte Benutzerlizenzen. Neu zugewiesene SKUs aktivieren alle Servicepläne; gruppenbasierte Lizenzen werden nicht entfernt. Dynamische, synchronisierte, rollenfähige und Exchange-verwaltete Gruppen sind für Mitgliedschaftsänderungen ausgeschlossen. `block_signin` sperrt zukünftige Anmeldungen; es widerruft keine bestehenden Sitzungen. Große Inventare werden ausdrücklich als begrenzte erste Seite ausgewiesen; diese Version implementiert keinen vollständigen Export.
 
@@ -27,7 +30,7 @@ Schreibzugriff ist in der Beispielkonfiguration abgeschaltet. Für den ersten Te
 ## 1. Entra-Anwendung und Zertifikat
 
 1. Im eigenen Entra-Tenant eine App registrieren: Konten in beliebigen Organisationsverzeichnissen, keine privaten Microsoft-Konten. Application-/Client-ID notieren.
-2. Ein RSA-Zertifikat erstellen oder ein verwaltetes Zertifikat verwenden. Öffentlichen Zertifikatsteil unter **Certificates & secrets → Certificates** hochladen. Privater Schlüssel bleibt beim MCP.
+2. Zertifikat: Der Dienst erzeugt beim ersten Start selbst ein RSA-3072-Zertifikat (zwei Jahre gültig) im Volume unter `/data/certificate/`. Der private Schlüssel verlässt den Container nicht. Mit dem Tool `get_app_certificate` den öffentlichen Teil (PEM) abrufen, als `.cer` speichern und in Entra unter **Certificates & secrets → Certificates** hochladen. Der angezeigte SHA-1-Fingerabdruck muss mit dem in Entra übereinstimmen. Wer ein eigenes PFX verwenden will, setzt `CERTIFICATE_PATH` und `CERTIFICATE_PASSWORD_FILE`.
 3. Für Graph **Application permissions**, keine delegierten Berechtigungen, konfigurieren:
 
 | Funktion | Anwendungsberechtigung |
@@ -63,90 +66,72 @@ Referenzen:
 - https://learn.microsoft.com/en-us/graph/api/user-update
 - https://learn.microsoft.com/en-us/microsoft-365/admin/email/convert-user-mailbox-to-shared-mailbox
 
-### Beispiel für ein Zertifikat auf dem eigenen Host
-
-```bash
-umask 077
-openssl req -x509 -newkey rsa:3072 -sha256 -days 365 \
-  -keyout app.key -out app.crt -subj '/CN=m365-cloud-mcp'
-openssl pkcs12 -export -inkey app.key -in app.crt -out m365.pfx
-```
-
-OpenSSL fragt Passwörter interaktiv ab. Das PFX-Exportpasswort in einer Datei `pfx_password` im Secret-Verzeichnis speichern, ohne zusätzliche Leerzeichen. `app.crt` wird in Entra hochgeladen. Den privaten Schlüssel und das PFX nicht hochladen, nicht im Chat senden und nicht ins Repository übernehmen. Zertifikatsablauf überwachen und Rotation vor Ablauf einplanen. Access-Tokens laufen ebenfalls ab; MSAL erneuert sie automatisch.
+Vor Ablauf ein neues Zertifikat erzeugen (Dateien in `/data/certificate/` entfernen und Container neu starten), in Entra hochladen und das alte erst danach entfernen.
 
 ## 2. Kunden und Bediener konfigurieren
 
+Die gesamte Konfiguration steht als JSON in der Stack-Variable `TENANTS_JSON` (Aufbau wie `config/tenants.example.json`). Alternativ liest der Dienst eine Datei unter `CONFIG_PATH`.
+
 ```bash
-cp config/tenants.example.json config/tenants.json
 python scripts/create-client-token.py
 ```
 
 Das Script zeigt einen zufälligen geheimen Bearer-Token und dessen SHA-256-Hash. Nur den Hash in `token_sha256` eintragen. Den Token im Secret Store des MCP-Clients aufbewahren. Für jeden Bediener einen eigenen Token und eindeutigen Namen verwenden.
 
-In `tenants.json` eintragen:
+Felder:
 
-- `client_id`: ID der eigenen mandantenfähigen App.
-- `alias`: eindeutiger Kundenalias, beispielsweise `kunde-a`.
-- `tenant_id`: verifizierte Kunden-Tenant-UUID.
-- `organization`: ursprüngliche Kunden-Domain `xyz.onmicrosoft.com`, keine frei wählbare Maildomain.
-- `writes`: pro Kunde zunächst `false`.
+- `client_id`: ID der eigenen mandantenfähigen App. Darf leer bleiben, solange die App noch nicht existiert; Microsoft-Aufrufe schlagen dann kontrolliert fehl.
+- `tenants[].alias`: eindeutiger Kundenalias, beispielsweise `kunde-a`.
+- `tenants[].tenant_id`: verifizierte Kunden-Tenant-UUID.
+- `tenants[].organization`: ursprüngliche Kunden-Domain `xyz.onmicrosoft.com`, keine frei wählbare Maildomain.
+- `tenants[].writes`: pro Kunde zunächst `false`.
 - `clients[].tenants`: für diesen Bediener freigegebene Aliase.
 - `clients[].can_write`: zusätzlich erforderliche Schreibfreigabe des Bedieners.
 
-Beide Schreibflags müssen `true` sein, damit Änderungen möglich sind. Konfiguration wird beim Start geladen; nach ACL-Änderungen oder Tokenwiderruf den Dienst neu starten. Alle Replikate müssen die Änderung übernehmen. Nur **eine Instanz** mit diesem lokalen SQLite-Volume betreiben.
+Beide Schreibflags müssen `true` sein, damit Änderungen möglich sind. Die Konfiguration wird beim Start geladen; nach Änderungen den Stack neu deployen. Nur **eine Instanz** mit diesem SQLite-Volume betreiben.
 
 ## 3. Image
 
-Das Image wird von Portainer beim Deployen des Git-Stacks direkt auf dem Docker-Host aus dem `Dockerfile` dieses Repositorys gebaut (`build:` und `pull_policy: build` in `docker-compose.yml`). Eine Registry ist nicht nötig. Für einen manuellen Build:
+GitHub Actions (`.github/workflows/docker-publish.yml`) testet und baut bei jedem Push auf `main` das Image `ghcr.io/kdt-solutions/o365-mcp` (Tags `latest` und `sha-<commit>`). Vor dem Push laufen die Unit-Tests und ein Smoke-Test im fertigen Container. Version, Commit und Build-Datum liefert das Tool `get_version`.
 
-```bash
-docker build -t m365-cloud-mcp:local .
-```
+Das Image enthält Python 3.12, PowerShell 7.4 und ExchangeOnlineManagement 3.9.0, nur für amd64.
 
-Das Image enthält Python 3.12, PowerShell 7.4 und ExchangeOnlineManagement 3.9.0. Python-Abhängigkeiten sind in `requirements.lock` festgelegt; Basisimages erhalten Sicherheitsupdates über ihre Tags. Für vollständig fixierte Releases die geprüften Basisimage-Digests festhalten. Auf ARM-Hosts zuerst die Verfügbarkeit der Basisimages und des EXO-Moduls prüfen; gegebenenfalls auf einem amd64-Host bauen und betreiben.
+## 4. Daten
 
-Der Docker-Host braucht beim Build Zugriff auf `mcr.microsoft.com`, Docker Hub, die PowerShell Gallery und PyPI.
+Es werden keine Dateien auf dem Docker-Host benötigt. Das benannte Volume `data` enthält Pläne, Audit-Log und das App-Zertifikat. Für Backups SQLite-kompatible Backups oder einen gestoppten Dienst verwenden. Das Audit enthält Kunden- und Zielobjekt-IDs.
 
-## 4. Dateien auf dem Docker-Host bereitstellen
+Audit: ein Eintrag pro Aufruf mit Ergebnis und Dauer (`duration_ms`); schreibende Aktionen zusätzlich mit einem `executing`-Eintrag vor dem Remote-Aufruf. Einträge älter als `AUDIT_RETENTION_DAYS` (Standard 365, `0` = unbegrenzt) und abgelaufene Pläne werden stündlich gelöscht.
 
-Beispielpfade:
+## 5. Portainer-Stack
 
-```text
-/srv/m365-mcp/config/tenants.json
-/srv/m365-mcp/secrets/m365.pfx
-/srv/m365-mcp/secrets/pfx_password
-```
-
-Der Container läuft als UID/GID `10001`. Verzeichnisse müssen für diese Identität durchquerbar und die Dateien lesbar sein. Beispielsweise Eigentümer `root:10001`, Verzeichnisse `0750`, Dateien `0440`. Keine Geheimnisse als Stack-Umgebungsvariablen eintragen. Die Pfade müssen auf dem Docker-/Agent-Host liegen, nicht nur auf dem Portainer-Server.
-
-Das benannte Volume `m365_data` enthält Pläne und das Audit-Log. Für Backups SQLite-kompatible Backups oder einen gestoppten Dienst verwenden; keinen ungeschützten Live-Dateikopie-Workflow einrichten. Audit enthält Kunden- und Zielobjekt-IDs. Zugriffsrechte und Aufbewahrung entsprechend festlegen. Der Dienst rotiert Auditdaten noch nicht automatisch.
-
-## 5. Portainer-Stack starten
-
-In Portainer **Stacks → Add stack → Repository** wählen. Für Docker Standalone ausgelegt, nicht für Swarm.
+Portainer **Stacks → Add stack → Repository**, Docker Standalone:
 
 - Repository URL: `https://github.com/KDT-Solutions/o365-mcp`
-- Repository reference: Branch, aus dem deployt werden soll, z.B. `refs/heads/main`
+- Repository reference: `refs/heads/main`
 - Compose path: `docker-compose.yml`
-- Authentication: bei privatem Repository aktivieren, GitHub-Benutzer und ein Personal Access Token mit Lesezugriff auf das Repository hinterlegen
-- Optional **GitOps updates** aktivieren (Polling oder Webhook), damit Portainer neue Commits automatisch baut und deployt
 
-Folgende Stack-Variablen unter **Environment variables** setzen:
+Stack-Variablen:
 
-```text
-MCP_HOST=mcp.deine-domain.de
-MCP_PORT=8085
-MCP_CONFIG_DIR=/srv/m365-mcp/config
-MCP_SECRET_DIR=/srv/m365-mcp/secrets
-```
+| Variable | Bedeutung |
+|---|---|
+| `TENANTS_JSON` | Konfiguration (Pflicht) |
+| `MCP_BIND_ADDR` | Host-IP, auf die der Reverse-Proxy zugreift, z.B. `192.0.2.10` |
+| `MCP_HOST_PORT` | Host-Port, Standard `8437` |
+| `MCP_PUBLIC_HOST` | Öffentlicher Hostname, Standard `mcp.example.com` |
+| `MCP_PATH` | MCP-Endpunkt, Standard `/o365` |
+| `AUDIT_RETENTION_DAYS` | Aufbewahrung Audit, Standard `365` |
+| `EXCHANGE_MAX_SESSIONS` | Gleichzeitige Exchange-Sitzungen, Standard `2` |
+| `EXCHANGE_IDLE_SECONDS` | Leerlauf bis zum Schliessen einer Exchange-Sitzung, Standard `600` |
 
-`MCP_IMAGE` ist optional und legt nur den lokalen Tag des gebauten Images fest (Standard `m365-cloud-mcp:local`). Nach einem Update im Repository den Stack mit **Pull and redeploy** neu deployen; dabei wird das Image neu gebaut.
+Nach einem neuen Image den Stack mit **Pull and redeploy** aktualisieren.
 
-Der MCP-Port wird ausschließlich an `127.0.0.1` des Docker-Hosts gebunden. Ein vorhandener HTTPS-Reverse-Proxy auf diesem Host leitet an `http://127.0.0.1:8085` weiter. `Caddyfile.example` zeigt diese Variante; Caddy ist nicht Teil des Stacks. Bei einem Reverse-Proxy in einem anderen Container stattdessen ein gemeinsames internes Docker-Netz konfigurieren und an `m365-mcp:8000` weiterleiten. `127.0.0.1` innerhalb eines anderen Containers zeigt nicht auf den Host.
+Der Reverse-Proxy (Nginx Proxy Manager) leitet `https://mcp.example.com` an `http://MCP_BIND_ADDR:MCP_HOST_PORT` weiter und muss den Host- und Authorization-Header durchreichen. Der Dienst prüft den Host-Header gegen `MCP_PUBLIC_HOST`.
 
-Öffentliches Ziel: `https://mcp.deine-domain.de/mcp`. Der Proxy muss den ursprünglichen Host-Header und den Authorization-Header weiterleiten, Streaming unterstützen und HTTPS erzwingen. Bei URLs mit explizitem Port `ALLOWED_HOSTS` entsprechend anpassen. Keine Request-Header mit Bearer-Tokens im Proxy protokollieren.
+`/healthz` prüft nur, ob der HTTP-Dienst läuft; es führt keinen Microsoft-Login aus.
 
-`/healthz` prüft, ob der HTTP-Dienst läuft; es führt keinen Microsoft-Login aus und bestätigt keine Graph-/Exchange-Berechtigungen.
+### Exchange-Sitzungen
+
+Pro Kundentenant läuft eine dauerhafte PowerShell-Sitzung, die nach dem ersten Aufruf verbunden bleibt. Weitere Aufrufe sparen Prozessstart und Anmeldung. Sitzungen werden nach `EXCHANGE_IDLE_SECONDS` Leerlauf und spätestens nach 45 Minuten geschlossen und beim nächsten Aufruf neu aufgebaut. Höchstens `EXCHANGE_MAX_SESSIONS` Sitzungen gleichzeitig; bei Bedarf wird die am längsten unbenutzte geschlossen. Bricht ein Aufruf ab (Timeout 180 s), wird die Sitzung verworfen und nicht wiederverwendet.
 
 ## 6. MCP-Client verbinden
 
@@ -157,7 +142,7 @@ Für Clients mit Streamable HTTP und eigenen Authorization-Headern:
   "mcpServers": {
     "m365": {
       "type": "http",
-      "url": "https://mcp.deine-domain.de/mcp",
+      "url": "https://mcp.example.com/o365",
       "headers": { "Authorization": "Bearer DEIN_GEHEIMER_CLIENT_TOKEN" }
     }
   }

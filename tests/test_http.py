@@ -294,8 +294,10 @@ def test_file_share_plan(config, tmp_path, monkeypatch):
 
     async def request(tenant, path, params=None, body=None):
         paths.append(path)
-        if '/search(' in path:
-            return {'value': [{'id': '01ABC!12', 'name': 'Meeting.mp4', 'size': 5, 'parentReference': {'path': '/drive/root:/Recordings'}, 'file': {}}]}
+        if path.endswith('/drive/root/children'):
+            return {'value': [{'id': '01FOLDER', 'name': 'Recordings', 'folder': {}}, {'id': '01OTHER', 'name': 'Notes.docx', 'file': {}}]}
+        if path.endswith('/drive/items/01FOLDER/children'):
+            return {'value': [{'id': '01ABC!12', 'name': 'Xylem Meeting.mp4', 'size': 5, 'file': {}}]}
         if '/drive/items/' in path:
             return {'id': '01ABC!12', 'name': 'Meeting.mp4', 'size': 5, 'parentReference': {'path': '/drive/root:/Recordings'}}
         return {'id': '00000000-0000-0000-0000-000000000005', 'displayName': 'Test User', 'userPrincipalName': 'test.user@alpha.example'}
@@ -316,7 +318,7 @@ def test_file_share_plan(config, tmp_path, monkeypatch):
                 user = '00000000-0000-0000-0000-000000000005'
                 assert (await tool('find_user_files', {'tenant': 'alpha', 'user_id': user, 'query': "x') or ('"}))[0]['isError']
                 _, found = await tool('find_user_files', {'tenant': 'alpha', 'user_id': user, 'query': 'Xylem'})
-                assert found['items'][0]['id'] == '01ABC!12'
+                assert [i['path'] for i in found['items']] == ['/Recordings/Xylem Meeting.mp4'] and found['scanned'] == 3
                 assert (await tool('prepare_file_share', {'tenant': 'alpha', 'owner_user_id': user, 'item_id': '../x', 'recipient_user_id': user}))[0]['isError']
                 _, plan = await tool('prepare_file_share', {'tenant': 'alpha', 'owner_user_id': user, 'item_id': '01ABC!12',
                                                             'recipient_user_id': user, 'role': 'write'})

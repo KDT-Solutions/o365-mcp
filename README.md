@@ -20,7 +20,8 @@ Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft G
 | `list_licenses` | Abonnierte Lizenz-SKUs und Verbrauch |
 | `list_mailboxes` | Erste maximal 100 Exchange-Postfächer |
 | `get_mailbox` | Einzelnes Postfach über Entra-Objekt-ID oder SMTP-Adresse (auch freigegebene Postfächer und Räume) |
-| `find_user_files` | Dateien im OneDrive eines Benutzers suchen (z.B. Teams-Aufzeichnungen) |
+| `find_user_files` | Dateien im OneDrive eines Benutzers nach Namen suchen (durchläuft die Ordner, da die Graph-Suche App-Zugriff nicht unterstützt) |
+| `list_user_folder` | Einen Ordner im OneDrive eines Benutzers auflisten |
 | `prepare_file_share` | Plan, eine Datei aus einem OneDrive mit einem Benutzer desselben Tenants zu teilen (ohne Einladungsmail) |
 | `get_mailbox_permissions` | Vollzugriff, Senden-als und Kalenderberechtigungen eines Postfachs (Standardkalender oder bestimmter Kalenderordner) |
 | `find_calendar_folders` | Kalenderordner nach Namen in allen Benutzer-, freigegebenen und Raumpostfächern suchen |

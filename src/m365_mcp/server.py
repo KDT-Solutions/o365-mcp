@@ -338,16 +338,35 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
 
     @mcp.tool(annotations={'readOnlyHint': True})
     async def find_user_files(tenant: str, user_id: str, query: str) -> dict:
-        """Search a user's OneDrive by file name/content (e.g. a Teams meeting recording in the Recordings folder). query: 2-64 letters, digits, spaces, dots, hyphens. Requires Files.ReadWrite.All or Files.Read.All. Returns at most 50 hits."""
+        """Find files and folders in a user's OneDrive whose name contains query (case-insensitive), e.g. a Teams recording. Walks the folder tree (max. depth 8, max. 5000 entries) because Graph's drive search does not support app-only access. query: 2-64 letters, digits, spaces, dots, hyphens."""
         user_id = str(uuid.UUID(user_id))
         if not FILE_QUERY.fullmatch(query or ''):
             raise ValueError('query: 2-64 letters, digits, spaces, dots, hyphens or underscores')
-        data = await read(tenant, 'find_user_files', lambda t: graph.request(t, f"users/{user_id}/drive/root/search(q='{query}')",
-            {'$select': 'id,name,size,createdDateTime,lastModifiedDateTime,parentReference,file,folder', '$top': '50'}), user_id)
-        items = [{'id': i.get('id'), 'name': i.get('name'), 'size': i.get('size'), 'created': i.get('createdDateTime'),
-                  'modified': i.get('lastModifiedDateTime'), 'folder_path': (i.get('parentReference') or {}).get('path'),
-                  'is_folder': 'folder' in i} for i in data.get('value', [])]
-        return {'items': items, 'more_available': '@odata.nextLink' in data}
+        needle = query.lower()
+
+        async def walk(t):
+            hits, scanned, pending = [], 0, [('', f'users/{user_id}/drive/root/children', 0)]
+            truncated = False
+            while pending:
+                path, url, depth = pending.pop(0)
+                data = await graph.request(t, url, {'$select': 'id,name,size,createdDateTime,lastModifiedDateTime,file,folder', '$top': '999'})
+                truncated = truncated or '@odata.nextLink' in data
+                for item in data.get('value', []):
+                    scanned += 1
+                    name = item.get('name', '')
+                    full = f'{path}/{name}'
+                    if needle in name.lower():
+                        hits.append({'id': item.get('id'), 'name': name, 'path': full, 'size': item.get('size'),
+                                     'created': item.get('createdDateTime'), 'modified': item.get('lastModifiedDateTime'),
+                                     'is_folder': 'folder' in item})
+                    if 'folder' in item and depth < 8 and ITEM_ID.fullmatch(item.get('id', '')):
+                        pending.append((full, f"users/{user_id}/drive/items/{item['id']}/children", depth + 1))
+                    if scanned >= 5000:
+                        return hits, scanned, True
+            return hits, scanned, truncated
+
+        hits, scanned, truncated = await read(tenant, 'find_user_files', walk, user_id)
+        return {'items': hits[:200], 'scanned': scanned, 'incomplete': truncated or len(hits) > 200}
 
     @mcp.tool(annotations={'readOnlyHint': True})
     async def list_user_folder(tenant: str, user_id: str, folder: str = '') -> dict:

@@ -45,6 +45,7 @@ Schreibzugriff ist in der Beispielkonfiguration abgeschaltet. Für den ersten Te
 | Benutzer lesen | `User.Read.All` |
 | Gruppen lesen | `Group.Read.All` |
 | Lizenzbestand lesen | `LicenseAssignment.Read.All` |
+| Kunden prüfen (`verify_tenant`) | `Organization.Read.All` |
 | Anmeldung sperren, optional | Zusätzlich `User.EnableDisableAccount.All` |
 | Direkte Benutzerlizenzen ändern, optional | Zusätzlich `LicenseAssignment.ReadWrite.All` |
 | Gruppenmitgliedschaft ändern, optional | Zusätzlich `GroupMember.ReadWrite.All` |

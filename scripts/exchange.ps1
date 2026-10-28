@@ -35,6 +35,18 @@ function Get-CalendarFolder($address, $path) {
     return $address + ':' + ($folder.FolderPath -replace '/', '\')
 }
 
+# Fixed messages thrown by this script, safe to return as they contain no customer data.
+$ownErrors = @('Invalid mailbox', 'Invalid folder path', 'Calendar folder not found', 'Invalid query', 'Invalid group',
+               'Invalid member', 'Invalid trustee', 'Invalid calendar role', 'Unsupported right', 'Unsupported action')
+function Get-Reason($record) {
+    $id = [string]$record.FullyQualifiedErrorId
+    if ($ownErrors -contains $record.Exception.Message) { return $record.Exception.Message }
+    foreach ($text in @($id, [string]$record.Exception.Message)) {
+        if ($text -match '([A-Za-z]{3,60}Exception)') { return $Matches[1] }
+    }
+    return $record.Exception.GetType().Name
+}
+
 $connected = $false
 try {
     $settings = [Console]::In.ReadLine() | ConvertFrom-Json
@@ -142,7 +154,7 @@ try {
             Send-Reply @{ ok = $true; result = $result }
         } catch {
             # Do not leak tokens, customer output or PowerShell exception text; only the exception type is returned.
-            Send-Reply @{ ok = $false; reason = $_.Exception.GetType().Name }
+            Send-Reply @{ ok = $false; reason = (Get-Reason $_) }
             # A lost connection ends the worker; the caller starts a fresh one on the next request.
             $state = @(Get-ConnectionInformation -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Connected' })
             if (-not $state.Count) { exit 1 }

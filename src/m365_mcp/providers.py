@@ -303,6 +303,6 @@ class Exchange:
                 raise RuntimeError('Exchange execution interrupted; verify remote state before retrying') from None
             session.used = time.monotonic()
         if not reply.get('ok'):
-            reason = reply.get('reason') if re.fullmatch(r'[A-Za-z]{1,80}', str(reply.get('reason', ''))) else 'unknown'
+            reason = reply.get('reason') if re.fullmatch(r'[A-Za-z ]{1,80}', str(reply.get('reason', ''))) else 'unknown'
             raise ExchangeError(f'Exchange command failed ({reason}); verify consent, RBAC and target. Remote state may have changed.')
         return reply.get('result')

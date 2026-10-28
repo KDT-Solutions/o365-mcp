@@ -65,7 +65,7 @@ try {
                     $sendAs = @(Get-EXORecipientPermission -Identity $address | Where-Object { $_.Trustee -notlike 'NT AUTHORITY\*' } |
                         Select-Object @{n='Trustee';e={$_.Trustee.ToString()}}, @{n='AccessRights';e={($_.AccessRights | ForEach-Object { $_.ToString() }) -join ','}})
                     $calendar = Get-CalendarFolder $address $p.folder
-                    $calendarRights = @(Get-EXOMailboxFolderPermission -Identity $calendar |
+                    $calendarRights = @(Get-MailboxFolderPermission -Identity $calendar |
                         Select-Object @{n='User';e={$_.User.ToString()}}, @{n='AccessRights';e={($_.AccessRights | ForEach-Object { $_.ToString() }) -join ','}})
                     $result = @{ mailbox = $address; display_name = $mbx.DisplayName; type = $mbx.RecipientTypeDetails.ToString()
                                  full_access = $full; send_as = $sendAs; calendar_folder = $calendar; calendar = $calendarRights }
@@ -118,7 +118,7 @@ try {
                         'calendar' {
                             $calendar = Get-CalendarFolder $address $p.folder
                             $existing = $null
-                            try { $existing = Get-EXOMailboxFolderPermission -Identity $calendar -User $trustee -ErrorAction Stop } catch { $existing = $null }
+                            try { $existing = Get-MailboxFolderPermission -Identity $calendar -User $trustee -ErrorAction Stop } catch { $existing = $null }
                             if ($add) {
                                 if ($p.role -notin @('Reviewer', 'Author', 'Editor')) { throw 'Invalid calendar role' }
                                 if ($existing) { Set-MailboxFolderPermission -Identity $calendar -User $trustee -AccessRights $p.role -Confirm:$false | Out-Null }
@@ -141,8 +141,8 @@ try {
             }
             Send-Reply @{ ok = $true; result = $result }
         } catch {
-            # Do not leak tokens, customer output or PowerShell exception internals to MCP clients.
-            Send-Reply @{ ok = $false }
+            # Do not leak tokens, customer output or PowerShell exception text; only the exception type is returned.
+            Send-Reply @{ ok = $false; reason = $_.Exception.GetType().Name }
             # A lost connection ends the worker; the caller starts a fresh one on the next request.
             $state = @(Get-ConnectionInformation -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Connected' })
             if (-not $state.Count) { exit 1 }

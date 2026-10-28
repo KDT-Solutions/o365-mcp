@@ -159,6 +159,10 @@ def validate_member(payload):
     return {'member': member, 'add': add}
 
 
+class ExchangeError(RuntimeError):
+    """Exchange rejected a command; the message contains only the exception type, never customer data."""
+
+
 MARKER = b'@@M365@@'
 
 
@@ -299,5 +303,6 @@ class Exchange:
                 raise RuntimeError('Exchange execution interrupted; verify remote state before retrying') from None
             session.used = time.monotonic()
         if not reply.get('ok'):
-            raise RuntimeError('Exchange command failed; verify consent, RBAC and target. Remote state may have changed.')
+            reason = reply.get('reason') if re.fullmatch(r'[A-Za-z]{1,80}', str(reply.get('reason', ''))) else 'unknown'
+            raise ExchangeError(f'Exchange command failed ({reason}); verify consent, RBAC and target. Remote state may have changed.')
         return reply.get('result')

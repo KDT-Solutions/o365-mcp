@@ -16,7 +16,7 @@ import uvicorn
 
 from .certs import certificate_info, ensure_certificate
 from .core import ALIAS, Registry, Store, Tenant
-from .providers import CALENDAR_ROLES, MAILBOX_RIGHTS, Exchange, Graph, mailbox_reference, validate_folder
+from .providers import ExchangeError, CALENDAR_ROLES, MAILBOX_RIGHTS, Exchange, Graph, mailbox_reference, validate_folder
 
 actor = contextvars.ContextVar('actor')
 PUBLIC_PATHS = ('/healthz', '/consent-done')
@@ -91,8 +91,10 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         started = time.monotonic()
         try:
             result = await operation(tenant)
-        except Exception:
+        except Exception as error:
             store.audit(name, alias, action, target, 'failed', elapsed(started))
+            if isinstance(error, ExchangeError):
+                raise RuntimeError(str(error)) from None
             raise RuntimeError('Provider operation failed. Check tenant permissions and service configuration.') from None
         store.audit(name, alias, action, target, 'succeeded', elapsed(started))
         return result

@@ -22,6 +22,8 @@ services:
       MCP_PATH: ${MCP_PATH:-/o365}
       ALLOWED_HOSTS: ${MCP_PUBLIC_HOST:-mcp.example.com},localhost:*,127.0.0.1:*
       ALLOWED_ORIGINS: https://${MCP_PUBLIC_HOST:-mcp.example.com}
+      # Must also be registered as Web redirect URI in the Entra app (admin consent landing page).
+      CONSENT_REDIRECT_URI: https://${MCP_PUBLIC_HOST:-mcp.example.com}/consent-done
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       EXCHANGE_MAX_SESSIONS: ${EXCHANGE_MAX_SESSIONS:-2}
       EXCHANGE_IDLE_SECONDS: ${EXCHANGE_IDLE_SECONDS:-600}
@@ -32,7 +34,7 @@ services:
       # only reachable on 127.0.0.1.
       - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8437}:8000"
     volumes:
-      # SQLite state, audit log and the generated app certificate.
+      # SQLite state (incl. customers added via add_tenant), audit log and the generated app certificate.
       - data:/data
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m,uid=10001,gid=10001

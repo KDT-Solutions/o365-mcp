@@ -4,7 +4,7 @@ Gewählt: App mit Zertifikat, mehrere freigegebene Kundentenants, Portainer Dock
 
 | Bereich | Implementiert | Noch erforderlich |
 |---|---|---|
-| Tenantzugriff | Kundenregister, Bediener-ACL, Bearer-Authentifizierung | Echte Kunden registrieren; OAuth ergänzen, wenn der MCP-Client es benötigt |
+| Tenantzugriff | Kundenregister (fest oder per `add_tenant` zur Laufzeit), Consent-Link, `verify_tenant`, Bediener-ACL, Bearer-Authentifizierung | Freigabe eines zur Laufzeit angelegten Kunden für weitere Bediener; OAuth ergänzen, wenn der MCP-Client es benötigt |
 | Benutzer | Auflisten, Detailabfrage, Kontosperrung, Sitzungswiderruf | Anlage, Profiländerungen, Wiederherstellung, Lösch- und Passwortprozesse |
 | Lizenzen | Inventar, direkte Zuweisung/Entfernung über bestätigten Plan | Einzelne Servicepläne, gruppenbasierte Zuweisung und Standardpakete |
 | Gruppen | Inventar, Mitglieder lesen, statische Cloud-Mitgliedschaften ändern | Eigentümer, Gruppenanlage, dynamische und Exchange-verwaltete Gruppen |

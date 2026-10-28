@@ -16,7 +16,8 @@ def config(tmp_path):
                          'organization': f'{alias}.onmicrosoft.com', 'writes': True}
                         for index, alias in enumerate(('alpha', 'beta'), 2)],
             'clients': [{'name': 'alice', 'token_sha256': hashlib.sha256(b'test-token').hexdigest(),
-                         'tenants': ['alpha'], 'can_write': True}]}
+                         'tenants': ['alpha'], 'can_write': True, 'can_manage_tenants': True},
+                        {'name': 'bob', 'token_sha256': hashlib.sha256(b'bob-token').hexdigest(), 'tenants': []}]}
     path = tmp_path / 'tenants.json'
     path.write_text(json.dumps(data))
     return path

@@ -12,8 +12,11 @@
     {
       "name": "operator-1",
       "token_sha256": "REPLACE_WITH_64_CHARACTER_SHA256_HEX_DIGEST",
-      "tenants": ["kunde-a"],
-      "can_write": false
+      "tenants": [
+        "kunde-a"
+      ],
+      "can_write": false,
+      "can_manage_tenants": false
     }
   ]
 }

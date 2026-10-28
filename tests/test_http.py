@@ -30,6 +30,19 @@ class FakeGraph:
     async def listing(self, *args):
         return {'items': []}
 
+    consented = False
+
+    async def resolve_tenant(self, domain):
+        self.calls.append(('resolve', domain))
+        return '00000000-0000-0000-0000-0000000000aa'
+
+    async def organization(self, tenant):
+        self.calls.append(('organization', tenant.alias))
+        if not self.consented:
+            raise RuntimeError('AADSTS consent missing')
+        return {'id': tenant.tenant_id, 'displayName': 'Kunde Gamma AG',
+                'verifiedDomains': [{'name': 'gamma.example', 'isInitial': False}, {'name': 'gammaag.onmicrosoft.com', 'isInitial': True}]}
+
 
 class FakeExchange:
     async def run(self, *args):
@@ -123,3 +136,64 @@ def test_custom_mcp_path(config, tmp_path, monkeypatch):
                 assert 'serverInfo' in response.json()['result']
                 assert (await client.post('/mcp', headers=headers, json=body)).status_code == 404
     asyncio.run(scenario())
+
+
+def test_tenant_management_persists_and_is_restricted(config, tmp_path, monkeypatch):
+    monkeypatch.setenv('ALLOWED_HOSTS', 'testserver')
+    monkeypatch.setenv('CONSENT_REDIRECT_URI', 'https://mcp.example.com/consent-done')
+    provider = FakeGraph()
+    state = tmp_path / 'state.db'
+
+    async def session(app, token, steps):
+        async with app.app.router.lifespan_context(app.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver') as client:
+                headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json, text/event-stream'}
+                async def tool(name, args):
+                    response = await client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                                                               'params': {'name': name, 'arguments': args}})
+                    assert response.status_code == 200, response.text
+                    result = response.json()['result']
+                    return result, (None if result.get('isError') else json.loads(result['content'][0]['text']))
+                return await steps(client, tool)
+
+    async def as_alice(client, tool):
+        page = await client.get('/consent-done?error=<script>x</script>&tenant=evil')
+        assert page.status_code == 200 and '<script>' not in page.text and 'evil' not in page.text
+        result, added = await tool('add_tenant', {'alias': 'gamma', 'domain': 'gamma.example'})
+        assert added['status'] == 'pending' and added['tenant_id'] == '00000000-0000-0000-0000-0000000000aa'
+        assert added['consent_url'].startswith('https://login.microsoftonline.com/00000000-0000-0000-0000-0000000000aa/adminconsent?')
+        assert 'redirect_uri=https%3A%2F%2Fmcp.example.com%2Fconsent-done' in added['consent_url']
+        assert (await tool('add_tenant', {'alias': 'gamma2', 'tenant_id': '00000000-0000-0000-0000-0000000000aa'}))[0]['isError']
+        assert (await tool('add_tenant', {'alias': 'alpha', 'domain': 'other.example'}))[0]['isError']
+        assert (await tool('add_tenant', {'alias': 'Bad Alias', 'domain': 'x.example'}))[0]['isError']
+        assert (await tool('list_users', {'tenant': 'gamma'}))[0]['isError']
+        assert (await tool('verify_tenant', {'tenant': 'alpha'}))[0]['isError']
+        _, failed = await tool('verify_tenant', {'tenant': 'gamma'})
+        assert failed['verified'] is False and 'consent_url' in failed
+        provider.consented = True
+        _, verified = await tool('verify_tenant', {'tenant': 'gamma'})
+        assert verified['verified'] is True and verified['organization'] == 'gammaag.onmicrosoft.com'
+        assert not (await tool('list_users', {'tenant': 'gamma'}))[0].get('isError')
+        _, preview = await tool('set_tenant_writes', {'tenant': 'gamma', 'enabled': True})
+        assert preview['writes_enabled'] is False
+        _, enabled = await tool('set_tenant_writes', {'tenant': 'gamma', 'enabled': True, 'confirmed': True})
+        assert enabled['writes_enabled'] is True
+
+    async def after_restart(client, tool):
+        result, _ = await tool('list_tenants', {})
+        gamma = next(t for t in result['structuredContent']['result'] if t['alias'] == 'gamma')
+        assert gamma['status'] == 'active' and gamma['writes_enabled'] is True and gamma['source'] == 'mcp'
+        _, kept = await tool('remove_tenant', {'tenant': 'gamma'})
+        assert 'removed' not in kept
+        _, removed = await tool('remove_tenant', {'tenant': 'gamma', 'confirmed': True})
+        assert removed['removed'] is True
+        assert (await tool('list_users', {'tenant': 'gamma'}))[0]['isError']
+
+    async def as_bob(client, tool):
+        assert (await tool('add_tenant', {'alias': 'delta', 'domain': 'delta.example'}))[0]['isError']
+        assert (await tool('verify_tenant', {'tenant': 'gamma'}))[0]['isError']
+        assert (await tool('list_users', {'tenant': 'gamma'}))[0]['isError']
+
+    asyncio.run(session(create_app(config, state, provider, FakeExchange()), 'test-token', as_alice))
+    asyncio.run(session(create_app(config, state, provider, FakeExchange()), 'bob-token', as_bob))
+    asyncio.run(session(create_app(config, state, provider, FakeExchange()), 'test-token', after_restart))

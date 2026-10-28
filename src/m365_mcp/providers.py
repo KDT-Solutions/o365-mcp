@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -8,6 +9,10 @@ import httpx
 import msal
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
+
+
+DOMAIN = re.compile(r'(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}')
+ISSUER = re.compile(r'https://login\.microsoftonline\.com/([0-9a-f-]{36})/v2\.0')
 
 
 class Graph:
@@ -58,6 +63,29 @@ class Graph:
         # Never expose or fetch arbitrary continuation URLs supplied by callers.
         return {'items': data.get('value', []), 'more_available': '@odata.nextLink' in data,
                 'notice': 'Bounded first page. Narrow administrative queries before changing objects.'}
+
+    async def resolve_tenant(self, domain):
+        """Look up the tenant ID of a verified customer domain via the public OpenID metadata. No credentials are sent."""
+        domain = domain.strip().lower()
+        if not DOMAIN.fullmatch(domain):
+            raise ValueError('Provide a plain domain such as example.com')
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            response = await client.get(f'https://login.microsoftonline.com/{domain}/v2.0/.well-known/openid-configuration')
+        if response.status_code in (400, 404):
+            raise ValueError('No Microsoft Entra tenant found for this domain')
+        if response.is_error:
+            raise RuntimeError(f'Tenant lookup failed with HTTP {response.status_code}')
+        match = ISSUER.fullmatch(response.json().get('issuer', ''))
+        if not match:
+            raise RuntimeError('Unexpected tenant metadata')
+        return str(uuid.UUID(match.group(1)))
+
+    async def organization(self, tenant):
+        data = await self.request(tenant, 'organization', {'$select': 'id,displayName,verifiedDomains'})
+        items = data.get('value', [])
+        if len(items) != 1:
+            raise RuntimeError('Unexpected organization response')
+        return items[0]
 
     async def block(self, tenant, target):
         target = str(uuid.UUID(target))

@@ -6,7 +6,12 @@ Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft G
 
 | Tool | Verhalten |
 |---|---|
-| `list_tenants` | Nur für den Bediener freigegebene Kundentenants |
+| `list_tenants` | Nur für den Bediener freigegebene Kundentenants mit Status (`pending`/`active`) und Herkunft (`config`/`mcp`) |
+| `add_tenant` | Neuen Kunden per Domain oder Tenant-ID anlegen; liefert den Admin-Consent-Link |
+| `get_consent_link` | Consent-Link erneut abrufen, z.B. nach neuen App-Berechtigungen |
+| `verify_tenant` | Zustimmung prüfen und Kunden aktivieren |
+| `set_tenant_writes` | Schreibzugriff für einen im MCP angelegten Kunden ein-/ausschalten (mit Bestätigung) |
+| `remove_tenant` | Im MCP angelegten Kunden entfernen (mit Bestätigung); ändert nichts beim Kunden |
 | `list_users` | Benutzer, Kontostatus und zugewiesene Lizenz-IDs; erste 1–999 Einträge |
 | `get_user` | Einzelbenutzer mit Kontostatus, Lizenzen und Nutzungsland |
 | `list_groups` | Gruppen; erste 1–999 Einträge |
@@ -53,7 +58,7 @@ Nur benötigte Rechte konfigurieren. Änderungen an privilegierten Administrator
 https://login.microsoftonline.com/KUNDEN-TENANT-ID/adminconsent?client_id=APP-CLIENT-ID&redirect_uri=URLENCODED_REGISTERED_REDIRECT_URI&state=RANDOM_STATE
 ```
 
-Der Redirect muss zur App-Registrierung passen und von dir kontrolliert werden. Diese Version bietet keinen automatischen Consent-Callback und übernimmt keine Tenant-ID aus einem Callback. Tenant-ID und Zustimmung anschließend unabhängig im Kundenportal verifizieren. Kein Kunden-Admin-Passwort gehört in den MCP.
+Diesen Link erzeugt das Tool `add_tenant` (siehe Abschnitt 2a). Als Redirect dient die statische Seite `https://MCP_PUBLIC_HOST/consent-done` des Dienstes. Sie muss in der App-Registrierung unter **Authentication → Web → Redirect URIs** eingetragen sein. Die Seite wertet keine Parameter aus und übernimmt keine Tenant-ID aus dem Callback; ob die Zustimmung tatsächlich erteilt wurde, prüft erst `verify_tenant` mit einer echten App-Anmeldung im Kundentenant. Kein Kunden-Admin-Passwort gehört in den MCP.
 
 6. **Zusätzlich Exchange autorisieren:** `Exchange.ManageAsApp` und Admin-Consent allein reichen für Cmdlets nicht. Dem **Service Principal der Enterprise Application beim Kunden** muss ein unterstütztes Exchange-Rollenmodell zugewiesen werden. Die Objekt-ID dieser Enterprise App unterscheidet sich von der Client-ID und von der Objekt-ID der App-Registrierung.
 
@@ -87,8 +92,23 @@ Felder:
 - `tenants[].writes`: pro Kunde zunächst `false`.
 - `clients[].tenants`: für diesen Bediener freigegebene Aliase.
 - `clients[].can_write`: zusätzlich erforderliche Schreibfreigabe des Bedieners.
+- `clients[].can_manage_tenants`: darf Kunden über die MCP-Tools anlegen, prüfen und entfernen (Standard `false`).
+
+Kunden lassen sich entweder hier in `TENANTS_JSON` fest eintragen oder zur Laufzeit über die Tools aus Abschnitt 2a anlegen. Fest eingetragene Kunden sind über die Tools nicht änderbar.
 
 Beide Schreibflags müssen `true` sein, damit Änderungen möglich sind. Die Konfiguration wird beim Start geladen; nach Änderungen den Stack neu deployen. Nur **eine Instanz** mit diesem SQLite-Volume betreiben.
+
+## 2a. Kunden über den MCP hinzufügen
+
+Voraussetzung: Der Bediener hat `can_manage_tenants: true`, die App-Registrierung existiert (`client_id` gesetzt, Zertifikat hochgeladen) und `https://MCP_PUBLIC_HOST/consent-done` ist in der App als Web-Redirect-URI eingetragen.
+
+1. `add_tenant(alias="kunde-a", domain="kunde-a.example")` – die Tenant-ID wird über die öffentlichen Microsoft-Metadaten der Domain ermittelt (alternativ `tenant_id` direkt angeben). Der Kunde wird mit Status `pending` gespeichert und dem anlegenden Bediener freigegeben. Schreibzugriff ist aus.
+2. Den zurückgegebenen `consent_url` im Browser öffnen, mit dem eigenen Admin-Konto **dieses** Kundentenants anmelden und zustimmen.
+3. `verify_tenant(tenant="kunde-a")` – meldet sich als App im Kundentenant an, gleicht die Tenant-ID ab, speichert die ursprüngliche `onmicrosoft.com`-Domain und setzt den Status auf `active`. Direkt nach der Zustimmung kann es einige Minuten dauern.
+4. Für Postfach-Tools beim Kunden der Enterprise-Anwendung eine Exchange-Rolle zuweisen (Abschnitt 1, Punkt 6).
+5. Optional `set_tenant_writes(tenant="kunde-a", enabled=true, confirmed=true)`.
+
+Die Kunden liegen in der SQLite-Datenbank im Volume `data`; ein Redeploy ist nicht nötig. `remove_tenant` entfernt den Kunden nur aus dem MCP. Um den Zugriff in Microsoft zu entziehen, beim Kunden die Enterprise-Anwendung löschen.
 
 ## 3. Image
 
@@ -98,7 +118,7 @@ Das Image enthält Python 3.12, PowerShell 7.4 und ExchangeOnlineManagement 3.9.
 
 ## 4. Daten
 
-Es werden keine Dateien auf dem Docker-Host benötigt. Das benannte Volume `data` enthält Pläne, Audit-Log und das App-Zertifikat. Für Backups SQLite-kompatible Backups oder einen gestoppten Dienst verwenden. Das Audit enthält Kunden- und Zielobjekt-IDs.
+Es werden keine Dateien auf dem Docker-Host benötigt. Das benannte Volume `data` enthält Pläne, Audit-Log, die über den MCP angelegten Kunden und das App-Zertifikat. Für Backups SQLite-kompatible Backups oder einen gestoppten Dienst verwenden. Das Audit enthält Kunden- und Zielobjekt-IDs.
 
 Audit: ein Eintrag pro Aufruf mit Ergebnis und Dauer (`duration_ms`); schreibende Aktionen zusätzlich mit einem `executing`-Eintrag vor dem Remote-Aufruf. Einträge älter als `AUDIT_RETENTION_DAYS` (Standard 365, `0` = unbegrenzt) und abgelaufene Pläne werden stündlich gelöscht.
 
@@ -119,6 +139,7 @@ Stack-Variablen:
 | `MCP_HOST_PORT` | Host-Port, Standard `8437` |
 | `MCP_PUBLIC_HOST` | Öffentlicher Hostname, Standard `mcp.example.com` |
 | `MCP_PATH` | MCP-Endpunkt, Standard `/o365` |
+
 | `AUDIT_RETENTION_DAYS` | Aufbewahrung Audit, Standard `365` |
 | `EXCHANGE_MAX_SESSIONS` | Gleichzeitige Exchange-Sitzungen, Standard `2` |
 | `EXCHANGE_IDLE_SECONDS` | Leerlauf bis zum Schliessen einer Exchange-Sitzung, Standard `600` |
@@ -127,7 +148,7 @@ Nach einem neuen Image den Stack mit **Pull and redeploy** aktualisieren.
 
 Der Reverse-Proxy (Nginx Proxy Manager) leitet `https://mcp.example.com` an `http://MCP_BIND_ADDR:MCP_HOST_PORT` weiter und muss den Host- und Authorization-Header durchreichen. Der Dienst prüft den Host-Header gegen `MCP_PUBLIC_HOST`.
 
-`/healthz` prüft nur, ob der HTTP-Dienst läuft; es führt keinen Microsoft-Login aus.
+`/healthz` prüft nur, ob der HTTP-Dienst läuft; es führt keinen Microsoft-Login aus. `/healthz` und `/consent-done` sind ohne Bearer-Token erreichbar; beide geben nur statische Inhalte aus.
 
 ### Exchange-Sitzungen
 

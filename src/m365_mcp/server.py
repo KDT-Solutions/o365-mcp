@@ -4,20 +4,28 @@ import json
 import os
 from pathlib import Path
 import time
+from urllib.parse import urlencode
 import uuid
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Mount, Route
 import uvicorn
 
 from .certs import certificate_info, ensure_certificate
-from .core import Registry, Store
+from .core import ALIAS, Registry, Store, Tenant
 from .providers import Exchange, Graph
 
 actor = contextvars.ContextVar('actor')
+PUBLIC_PATHS = ('/healthz', '/consent-done')
+# Static page after Microsoft admin consent. Query parameters are deliberately ignored:
+# nothing from the callback is trusted, reflected or stored.
+CONSENT_PAGE = '''<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zustimmung</title><style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5}</style></head>
+<body><h1>Zustimmung abgeschlossen</h1><p>Dieses Fenster kann geschlossen werden. Den Kunden anschliessend im MCP mit
+<code>verify_tenant</code> prüfen. Ob die Zustimmung wirklich erteilt wurde, zeigt erst diese Prüfung.</p></body></html>'''
 
 
 class Authentication:
@@ -25,7 +33,7 @@ class Authentication:
         self.app, self.registry = app, registry
 
     async def __call__(self, scope, receive, send):
-        if scope['type'] != 'http' or scope['path'] == '/healthz':
+        if scope['type'] != 'http' or scope['path'] in PUBLIC_PATHS:
             return await self.app(scope, receive, send)
         header = dict(scope['headers']).get(b'authorization', b'').decode('latin1')
         client = self.registry.authenticate(header[7:]) if header.startswith('Bearer ') else None
@@ -58,6 +66,8 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
     state_path = state_path or os.environ.get('STATE_PATH', '/data/state.db')
     Path(state_path).parent.mkdir(parents=True, exist_ok=True)
     store = Store(state_path, int(os.environ.get('AUDIT_RETENTION_DAYS', '365')))
+    registry.load(*store.tenants())
+    consent_redirect = os.environ.get('CONSENT_REDIRECT_URI', '')
     pfx = os.environ.get('CERTIFICATE_PATH', '')
     password = os.environ.get('CERTIFICATE_PASSWORD_FILE', '')
     if not (pfx and Path(pfx).exists()):
@@ -72,8 +82,8 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                   transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
                       allowed_hosts=allowed_hosts, allowed_origins=os.environ.get('ALLOWED_ORIGINS', '').split(',') if os.environ.get('ALLOWED_ORIGINS') else []))
 
-    def authorize(alias, write=False):
-        return registry.authorize(actor.get(), alias, write)
+    def authorize(alias, write=False, pending=False):
+        return registry.authorize(actor.get(), alias, write, pending)
 
     async def read(alias, action, operation, target=''):
         tenant = authorize(alias)
@@ -107,15 +117,109 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         """Read the audit log (newest first) for tenants this client may access. Optional filters: tenant alias, action, last N hours. limit 1-1000."""
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError('limit must be between 1 and 1000')
-        tenants = [authorize(tenant).alias] if tenant else list(actor.get()['tenants'])
+        tenants = [authorize(tenant, pending=True).alias] if tenant else sorted(registry.allowed(actor.get()))
         since = time.time() - hours * 3600 if hours else None
         return store.audit_log(tenants, limit, action, since)
 
     @mcp.tool(annotations={'readOnlyHint': True, 'openWorldHint': False})
     def list_tenants() -> list[dict]:
         """List customer aliases authorized for the authenticated MCP client."""
-        return [{'alias': t.alias, 'tenant_id': t.tenant_id, 'writes_enabled': t.writes and actor.get().get('can_write', False)}
-                for t in registry.tenants.values() if t.alias in actor.get()['tenants']]
+        allowed = registry.allowed(actor.get())
+        return [{'alias': t.alias, 'tenant_id': t.tenant_id, 'organization': t.organization or None, 'status': t.status,
+                 'source': 'mcp' if t.managed else 'config', 'writes_enabled': t.writes and actor.get().get('can_write', False)}
+                for t in sorted(registry.tenants.values(), key=lambda t: t.alias) if t.alias in allowed]
+
+    def consent_link(tenant):
+        if not registry.client_id:
+            raise ValueError('Entra app client_id is not configured')
+        params = {'client_id': registry.client_id}
+        if consent_redirect:
+            params['redirect_uri'] = consent_redirect
+        return f'https://login.microsoftonline.com/{tenant.tenant_id}/adminconsent?' + urlencode(params)
+
+    def consent_steps(tenant):
+        return {'consent_url': consent_link(tenant),
+                'next_steps': ['Open consent_url and sign in with your admin account of exactly this customer tenant; accept the permissions.',
+                               'Run verify_tenant with this alias. Graph tools work once verification succeeds.',
+                               'For mailbox tools assign an Exchange role to the enterprise application in this customer tenant (see README).']}
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def add_tenant(alias: str, domain: str | None = None, tenant_id: str | None = None) -> dict:
+        """Register a new customer tenant (status pending). Give a verified customer domain (tenant ID is looked up) or the tenant ID. Returns the admin consent link. Nothing changes in the customer tenant. Writes stay disabled."""
+        client = actor.get()
+        registry.require_manager(client)
+        if not ALIAS.fullmatch(alias or ''):
+            raise ValueError('Alias: lowercase letters, digits and hyphens, max 63 characters')
+        if alias in registry.tenants:
+            raise ValueError('Alias already exists')
+        if bool(domain) == bool(tenant_id):
+            raise ValueError('Provide either domain or tenant_id')
+        resolved = str(uuid.UUID(tenant_id)) if tenant_id else await graph.resolve_tenant(domain)
+        existing = registry.find_tenant_id(resolved)
+        if existing:
+            raise ValueError(f'Tenant already registered as {existing.alias}')
+        tenant = Tenant(alias, resolved, '', False, 'pending', True)
+        store.add_tenant(tenant, client['name'])
+        registry.register(tenant, client)
+        store.audit(client['name'], alias, 'add_tenant', resolved, 'succeeded')
+        return {'alias': alias, 'tenant_id': resolved, 'status': 'pending', 'resolved_from': domain or 'tenant_id', **consent_steps(tenant)}
+
+    @mcp.tool(annotations={'readOnlyHint': True, 'openWorldHint': False})
+    def get_consent_link(tenant: str) -> dict:
+        """Admin consent link for a tenant, e.g. to repeat consent after new permissions were added to the app."""
+        return {'alias': tenant, **consent_steps(authorize(tenant, pending=True))}
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def verify_tenant(tenant: str) -> dict:
+        """Check that admin consent works by signing in as the app and reading the organization. Activates a pending tenant and stores its initial onmicrosoft.com domain."""
+        client = actor.get()
+        current = registry.managed(client, tenant)
+        started = time.monotonic()
+        try:
+            organization = await graph.organization(current)
+        except Exception:
+            store.audit(client['name'], tenant, 'verify_tenant', current.tenant_id, 'failed', elapsed(started))
+            return {'alias': tenant, 'verified': False, 'status': current.status,
+                    'reason': 'App sign-in or Graph read failed. Consent missing, not yet propagated (wait a few minutes) or app certificate not uploaded.',
+                    **consent_steps(current)}
+        initial = next((d.get('name', '') for d in organization.get('verifiedDomains', []) if d.get('isInitial')), '')
+        if organization.get('id') != current.tenant_id or not initial.endswith('.onmicrosoft.com'):
+            store.audit(client['name'], tenant, 'verify_tenant', current.tenant_id, 'failed', elapsed(started))
+            raise RuntimeError('Organization response does not match the registered tenant')
+        store.update_tenant(tenant, organization=initial, status='active', display_name=organization.get('displayName'))
+        registry.update(tenant, organization=initial, status='active')
+        store.audit(client['name'], tenant, 'verify_tenant', current.tenant_id, 'succeeded', elapsed(started))
+        return {'alias': tenant, 'verified': True, 'status': 'active', 'display_name': organization.get('displayName'),
+                'organization': initial, 'exchange_notice': 'Mailbox tools additionally need an Exchange role for the enterprise application.'}
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    def set_tenant_writes(tenant: str, enabled: bool, confirmed: bool = False) -> dict:
+        """Enable or disable write tools for a tenant added via add_tenant. Requires confirmed=true after explicit operator confirmation."""
+        client = actor.get()
+        current = registry.managed(client, tenant)
+        if enabled and not client.get('can_write', False):
+            raise ValueError('This client has no write permission')
+        if current.status != 'active':
+            raise ValueError('Verify the tenant first')
+        if confirmed is not True:
+            return {'alias': tenant, 'writes_enabled': current.writes, 'requested': enabled, 'notice': 'Not changed. Repeat with confirmed=true after operator confirmation.'}
+        store.update_tenant(tenant, writes=bool(enabled))
+        registry.update(tenant, writes=bool(enabled))
+        store.audit(client['name'], tenant, 'set_tenant_writes', 'enabled' if enabled else 'disabled', 'succeeded')
+        return {'alias': tenant, 'writes_enabled': bool(enabled)}
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': True, 'openWorldHint': False})
+    def remove_tenant(tenant: str, confirmed: bool = False) -> dict:
+        """Remove a tenant added via add_tenant from this MCP. Does not touch the customer tenant: delete the enterprise application there to revoke access. Requires confirmed=true."""
+        client = actor.get()
+        current = registry.managed(client, tenant)
+        if confirmed is not True:
+            return {'alias': tenant, 'tenant_id': current.tenant_id, 'notice': 'Not removed. Repeat with confirmed=true after operator confirmation.'}
+        store.remove_tenant(tenant)
+        registry.unregister(tenant)
+        store.audit(client['name'], tenant, 'remove_tenant', current.tenant_id, 'succeeded')
+        return {'alias': tenant, 'removed': True,
+                'notice': 'Access still exists in Microsoft until the enterprise application is deleted in the customer tenant.'}
 
     @mcp.tool(annotations={'readOnlyHint': True})
     async def list_users(tenant: str, limit: int = 100) -> dict:
@@ -259,7 +363,11 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         return JSONResponse({'status': 'ok'})
 
     transport = mcp.streamable_http_app()
-    app = Starlette(routes=[Route('/healthz', health), Mount('/', app=transport)], lifespan=transport.router.lifespan_context)
+    async def consent_done(_):
+        return HTMLResponse(CONSENT_PAGE, headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
+                                                   'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'"})
+
+    app = Starlette(routes=[Route('/healthz', health), Route('/consent-done', consent_done), Mount('/', app=transport)], lifespan=transport.router.lifespan_context)
     return Authentication(app, registry)
 
 

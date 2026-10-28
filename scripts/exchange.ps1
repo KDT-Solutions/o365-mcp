@@ -21,7 +21,14 @@ function Resolve-Mailbox($p) {
     return Get-EXOMailbox -Identity $p.mailbox -Properties RecipientTypeDetails,ExternalDirectoryObjectId
 }
 
-function Get-CalendarFolder($address) {
+function Get-CalendarFolder($address, $path) {
+    if ($path) {
+        # Specific calendar folder such as "/Kalender/Jahreskalender"; validated by the caller.
+        if ($path -notmatch '^/[^:\\]{1,250}$') { throw 'Invalid folder path' }
+        $match = Get-EXOMailboxFolderStatistics -Identity $address -FolderScope Calendar | Where-Object { $_.FolderPath -eq $path } | Select-Object -First 1
+        if (-not $match) { throw 'Calendar folder not found' }
+        return $address + ':' + ($path -replace '/', '\')
+    }
     # The default calendar folder name is localized ("Kalender", "Calendar", ...), so look it up by type.
     $folder = Get-EXOMailboxFolderStatistics -Identity $address -FolderScope Calendar | Where-Object { $_.FolderType -eq 'Calendar' } | Select-Object -First 1
     if (-not $folder) { throw 'Calendar folder not found' }
@@ -57,11 +64,42 @@ try {
                         Select-Object @{n='User';e={$_.User.ToString()}}, @{n='AccessRights';e={($_.AccessRights | ForEach-Object { $_.ToString() }) -join ','}})
                     $sendAs = @(Get-EXORecipientPermission -Identity $address | Where-Object { $_.Trustee -notlike 'NT AUTHORITY\*' } |
                         Select-Object @{n='Trustee';e={$_.Trustee.ToString()}}, @{n='AccessRights';e={($_.AccessRights | ForEach-Object { $_.ToString() }) -join ','}})
-                    $calendar = Get-CalendarFolder $address
+                    $calendar = Get-CalendarFolder $address $p.folder
                     $calendarRights = @(Get-EXOMailboxFolderPermission -Identity $calendar |
                         Select-Object @{n='User';e={$_.User.ToString()}}, @{n='AccessRights';e={($_.AccessRights | ForEach-Object { $_.ToString() }) -join ','}})
                     $result = @{ mailbox = $address; display_name = $mbx.DisplayName; type = $mbx.RecipientTypeDetails.ToString()
                                  full_access = $full; send_as = $sendAs; calendar_folder = $calendar; calendar = $calendarRights }
+                }
+                'find_calendar_folders' {
+                    $needle = [string]$p.query
+                    if ($needle -notmatch '^[\p{L}\p{N} ._-]{3,64}$') { throw 'Invalid query' }
+                    $found = @()
+                    foreach ($mbx in Get-EXOMailbox -ResultSize Unlimited -RecipientTypeDetails UserMailbox,SharedMailbox,RoomMailbox,EquipmentMailbox) {
+                        try {
+                            $folders = Get-EXOMailboxFolderStatistics -Identity $mbx.PrimarySmtpAddress.ToString() -FolderScope Calendar -ErrorAction Stop
+                        } catch { continue }
+                        foreach ($folder in $folders) {
+                            if ($folder.Name -like ('*' + $needle + '*')) {
+                                $found += @{ mailbox = $mbx.PrimarySmtpAddress.ToString(); display_name = $mbx.DisplayName
+                                             type = $mbx.RecipientTypeDetails.ToString(); folder_path = $folder.FolderPath
+                                             items = $folder.ItemsInFolder }
+                            }
+                        }
+                    }
+                    $result = $found
+                }
+                'set_distribution_member' {
+                    if ($p.mailbox -notmatch '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$') { throw 'Invalid group' }
+                    $member = [string]$p.member
+                    if ($member -notmatch '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$') { throw 'Invalid member' }
+                    $group = Get-DistributionGroup -Identity $p.mailbox
+                    if ($p.add -eq $true) {
+                        Add-DistributionGroupMember -Identity $group.PrimarySmtpAddress.ToString() -Member $member -BypassSecurityGroupManagerCheck -Confirm:$false | Out-Null
+                    } else {
+                        Remove-DistributionGroupMember -Identity $group.PrimarySmtpAddress.ToString() -Member $member -BypassSecurityGroupManagerCheck -Confirm:$false | Out-Null
+                    }
+                    $result = @{ success = $true; group = $group.PrimarySmtpAddress.ToString(); member = $member; added = ($p.add -eq $true)
+                                 notice = 'Requested. Re-read members with list_group_members to verify.' }
                 }
                 'set_mailbox_permission' {
                     $address = (Resolve-Mailbox $p).PrimarySmtpAddress.ToString()
@@ -78,7 +116,7 @@ try {
                             else { Remove-RecipientPermission -Identity $address -Trustee $trustee -AccessRights SendAs -Confirm:$false | Out-Null }
                         }
                         'calendar' {
-                            $calendar = Get-CalendarFolder $address
+                            $calendar = Get-CalendarFolder $address $p.folder
                             $existing = $null
                             try { $existing = Get-EXOMailboxFolderPermission -Identity $calendar -User $trustee -ErrorAction Stop } catch { $existing = $null }
                             if ($add) {

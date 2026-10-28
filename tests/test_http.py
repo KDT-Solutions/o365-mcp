@@ -247,3 +247,37 @@ def test_mailbox_permission_plan(config, tmp_path, monkeypatch):
                 _, calendar = await tool('prepare_mailbox_permission', {**args, 'right': 'calendar', 'calendar_role': 'Editor'})
                 assert calendar['change']['calendar_role'] == 'Editor'
     asyncio.run(scenario())
+
+
+def test_distribution_membership_plan(config, tmp_path, monkeypatch):
+    monkeypatch.setenv('ALLOWED_HOSTS', 'testserver')
+    graph, exchange = FakeGraph(), FakeExchange()
+    app = create_app(config, tmp_path / 'state.db', graph, exchange)
+    groups = {'00000000-0000-0000-0000-00000000000a': {'id': 'a', 'mail': 'liste@alpha.example', 'mailEnabled': True, 'groupTypes': []},
+              '00000000-0000-0000-0000-00000000000b': {'id': 'b', 'mail': 'team@alpha.example', 'mailEnabled': True, 'groupTypes': ['Unified']}}
+
+    async def request(tenant, path, params=None, body=None):
+        if path.startswith('groups/'):
+            return groups[path.split('/')[1]]
+        return {'id': '00000000-0000-0000-0000-000000000005', 'displayName': 'Test User', 'userPrincipalName': 'test.user@alpha.example'}
+    graph.request = request
+
+    async def scenario():
+        async with app.app.router.lifespan_context(app.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver') as client:
+                headers = {'Authorization': 'Bearer test-token', 'Accept': 'application/json, text/event-stream'}
+                async def tool(name, args):
+                    response = await client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                                                               'params': {'name': name, 'arguments': args}})
+                    result = response.json()['result']
+                    return result, (None if result.get('isError') else json.loads(result['content'][0]['text']))
+                base = {'tenant': 'alpha', 'user_id': '00000000-0000-0000-0000-000000000005', 'add': False}
+                assert (await tool('prepare_distribution_membership', {**base, 'group_id': '00000000-0000-0000-0000-00000000000b'}))[0]['isError']
+                _, plan = await tool('prepare_distribution_membership', {**base, 'group_id': '00000000-0000-0000-0000-00000000000a'})
+                assert plan['target'] == 'liste@alpha.example'
+                assert not exchange.calls
+                result, _ = await tool('execute_plan', {'tenant': 'alpha', 'plan_id': plan['plan_id'], 'confirmed': True})
+                assert not result.get('isError'), result
+                assert exchange.calls[-1] == ('set_distribution_member', 'liste@alpha.example',
+                                              {'member': 'test.user@alpha.example', 'member_id': '00000000-0000-0000-0000-000000000005', 'add': False})
+    asyncio.run(scenario())

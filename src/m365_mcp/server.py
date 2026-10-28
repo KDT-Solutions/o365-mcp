@@ -16,7 +16,7 @@ import uvicorn
 
 from .certs import certificate_info, ensure_certificate
 from .core import ALIAS, Registry, Store, Tenant
-from .providers import CALENDAR_ROLES, MAILBOX_RIGHTS, Exchange, Graph, mailbox_reference
+from .providers import CALENDAR_ROLES, MAILBOX_RIGHTS, Exchange, Graph, mailbox_reference, validate_folder
 
 actor = contextvars.ContextVar('actor')
 PUBLIC_PATHS = ('/healthz', '/consent-done')
@@ -303,6 +303,27 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         store.audit(actor.get()['name'], tenant, action, group_id, 'planned')
         return plan
 
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def prepare_distribution_membership(tenant: str, group_id: str, user_id: str, add: bool) -> dict:
+        """Prepare adding/removing a user in a cloud distribution list (mail-enabled, non-Microsoft-365 group) via Exchange. Members receive the list's mail in their own mailbox. Confirm with execute_plan."""
+        authorize(tenant, write=True)
+        if type(add) is not bool:
+            raise ValueError('add must be a boolean')
+        group_id, user_id = str(uuid.UUID(group_id)), str(uuid.UUID(user_id))
+        group = await read(tenant, 'resolve_distribution_list', lambda t: graph.request(t, f'groups/{group_id}',
+            {'$select': 'id,displayName,mail,groupTypes,mailEnabled,securityEnabled,onPremisesSyncEnabled'}), group_id)
+        if not group.get('mailEnabled') or 'Unified' in group.get('groupTypes', []) or group.get('onPremisesSyncEnabled'):
+            raise ValueError('Only cloud distribution lists are supported; use prepare_group_membership for Microsoft 365 and security groups')
+        user = await read(tenant, 'resolve_distribution_member', lambda t: graph.request(t, f'users/{user_id}',
+            {'$select': 'id,displayName,userPrincipalName'}), user_id)
+        address, upn = str(group.get('mail') or ''), str(user.get('userPrincipalName') or '')
+        if not address or not upn:
+            raise ValueError('Group address or user could not be resolved')
+        plan = store.plan(actor.get()['name'], tenant, 'distribution_member', address, {'member': upn, 'member_id': user_id, 'add': add})
+        plan.update({'resolved_group': group, 'resolved_user': user, 'add': add})
+        store.audit(actor.get()['name'], tenant, 'distribution_member', address, 'planned')
+        return plan
+
     @mcp.tool(annotations={'readOnlyHint': True})
     async def list_mailboxes(tenant: str) -> dict:
         """Read at most 100 Exchange mailboxes. This is a bounded inventory, not a full export."""
@@ -316,15 +337,23 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         return await read(tenant, 'get_mailbox', lambda t: exchange.run(t, 'get_mailbox', reference), reference)
 
     @mcp.tool(annotations={'readOnlyHint': True})
-    async def get_mailbox_permissions(tenant: str, mailbox: str) -> dict:
-        """Read who has full access, send-as and default-calendar permissions on a mailbox (Entra object UUID or SMTP address). Inherited and system entries are omitted. Microsoft 365 group calendars are not covered."""
+    async def get_mailbox_permissions(tenant: str, mailbox: str, calendar_folder: str | None = None) -> dict:
+        """Read who has full access, send-as and calendar permissions on a mailbox (Entra object UUID or SMTP address). calendar_folder: optional folder path from find_calendar_folders (e.g. /Kalender/Jahreskalender); default is the main calendar. Inherited and system entries are omitted."""
         reference = next(iter(mailbox_reference(mailbox).values()))
-        return await read(tenant, 'get_mailbox_permissions', lambda t: exchange.run(t, 'mailbox_permissions', reference), reference)
+        extra = {'folder': validate_folder(calendar_folder)} if calendar_folder else None
+        return await read(tenant, 'get_mailbox_permissions', lambda t: exchange.run(t, 'mailbox_permissions', reference, extra), reference)
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def find_calendar_folders(tenant: str, query: str) -> dict:
+        """Search all user, shared, room and equipment mailboxes for calendar folders whose name contains query (3-64 characters). Slow on large tenants (one Exchange call per mailbox)."""
+        items = await read(tenant, 'find_calendar_folders', lambda t: exchange.run(t, 'find_calendar_folders', '', {'query': query}), query)
+        return {'items': items or [], 'query': query}
 
     @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
     async def prepare_mailbox_permission(tenant: str, mailbox: str, user_id: str, right: str, add: bool = True,
-                                         calendar_role: str | None = None, automapping: bool = True) -> dict:
-        """Prepare granting or removing a mailbox permission for a user. right: full_access (open the mailbox; automapping adds it to Outlook), send_as, or calendar (default calendar folder; calendar_role Reviewer = read, Author = create own, Editor = edit all). mailbox: Entra object UUID or SMTP address; user_id: Entra user UUID. Confirm with execute_plan."""
+                                         calendar_role: str | None = None, automapping: bool = True,
+                                         calendar_folder: str | None = None) -> dict:
+        """Prepare granting or removing a mailbox permission for a user. right: full_access (open the mailbox; automapping adds it to Outlook), send_as, or calendar (main calendar or calendar_folder from find_calendar_folders; calendar_role Reviewer = read, Author = create own, Editor = edit all). mailbox: Entra object UUID or SMTP address; user_id: Entra user UUID. Confirm with execute_plan."""
         authorize(tenant, write=True)
         if right not in MAILBOX_RIGHTS:
             raise ValueError('right must be full_access, send_as or calendar')
@@ -347,10 +376,15 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                    'automapping': automapping if right == 'full_access' else False}
         if right == 'calendar' and add:
             payload['role'] = calendar_role
+        if calendar_folder:
+            if right != 'calendar':
+                raise ValueError('calendar_folder applies to right=calendar only')
+            payload['folder'] = validate_folder(calendar_folder)
         action = 'mailbox_permission'
         plan = store.plan(actor.get()['name'], tenant, action, address, payload)
         plan.update({'resolved_mailbox': target, 'resolved_user': user,
-                     'change': {'right': right, 'add': add, 'calendar_role': payload.get('role'), 'automapping': payload['automapping']}})
+                     'change': {'right': right, 'add': add, 'calendar_role': payload.get('role'), 'calendar_folder': payload.get('folder'),
+                                'automapping': payload['automapping']}})
         if right == 'full_access' and add:
             plan['notice'] += ' Full access lets the user read all mail in this mailbox; it does not allow sending as the mailbox.'
         store.audit(actor.get()['name'], tenant, action, address, 'planned')
@@ -388,6 +422,8 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                 result = await graph.block(customer, target)
             elif action == 'convert_shared':
                 result = await exchange.run(customer, action, target)
+            elif action == 'distribution_member':
+                result = await exchange.run(customer, 'set_distribution_member', target, store.payload(plan_id))
             elif action == 'mailbox_permission':
                 result = await exchange.run(customer, 'set_mailbox_permission', target, store.payload(plan_id))
             elif action in ('assign_licenses', 'revoke_sessions', 'add_group_member', 'remove_group_member'):

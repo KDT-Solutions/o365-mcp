@@ -11,7 +11,7 @@ from m365_mcp.certs import certificate_info, ensure_certificate
 from m365_mcp.core import Registry, Store, Tenant
 import pytest
 
-from m365_mcp.providers import Exchange, mailbox_reference, validate_permission
+from m365_mcp.providers import Exchange, mailbox_reference, validate_folder, validate_permission
 
 FAKE_PWSH = '''#!{python}
 import json, os, sys
@@ -152,3 +152,24 @@ def test_exchange_sends_mailbox_address_and_permission(tmp_path, monkeypatch):
 
     assert asyncio.run(scenario()) == [{'org': 'alpha.onmicrosoft.com'}]
     assert 'call set_mailbox_permission' in log.read_text()
+
+
+def test_folder_and_query_validation(tmp_path, monkeypatch):
+    assert validate_folder('/Kalender/Jahreskalender SRFWL') == '/Kalender/Jahreskalender SRFWL'
+    for bad in ('Kalender', '/a:b', '/a\\b', '/x\n', ''):
+        with pytest.raises(ValueError):
+            validate_folder(bad)
+    with pytest.raises(ValueError):
+        validate_permission({'right': 'full_access', 'trustee': 'u@a.example', 'add': True, 'folder': '/Kalender'})
+    exchange, log = fake_exchange(tmp_path, monkeypatch)
+
+    async def scenario():
+        with pytest.raises(ValueError):
+            await exchange.run(tenant('alpha', 2), 'find_calendar_folders', '', {'query': 'a;b'})
+        await exchange.run(tenant('alpha', 2), 'find_calendar_folders', '', {'query': 'Jahreskalender'})
+        for key in list(exchange.sessions):
+            await exchange.discard(key)
+        exchange.reaper.cancel()
+
+    asyncio.run(scenario())
+    assert 'call find_calendar_folders' in log.read_text()

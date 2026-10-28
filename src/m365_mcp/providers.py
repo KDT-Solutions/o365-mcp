@@ -131,11 +131,32 @@ def validate_permission(payload):
     if right not in MAILBOX_RIGHTS or type(add) is not bool or not EMAIL.fullmatch(trustee or ''):
         raise ValueError('Invalid mailbox permission change')
     result = {'right': right, 'trustee': trustee, 'add': add, 'automapping': payload.get('automapping') is True}
+    if payload.get('folder'):
+        if right != 'calendar':
+            raise ValueError('A folder applies to calendar permissions only')
+        result['folder'] = validate_folder(payload['folder'])
     if right == 'calendar' and add:
         if payload.get('role') not in CALENDAR_ROLES:
             raise ValueError('Calendar role must be Reviewer, Author or Editor')
         result['role'] = payload['role']
     return result
+
+
+QUERY = re.compile(r'[\w .-]{3,64}')
+FOLDER = re.compile(r'/[^:\\\x00-\x1f]{1,250}')
+
+
+def validate_folder(path):
+    if not isinstance(path, str) or not FOLDER.fullmatch(path):
+        raise ValueError('Folder path must look like /Kalender/Name (from find_calendar_folders)')
+    return path
+
+
+def validate_member(payload):
+    member, add = payload.get('member'), payload.get('add')
+    if type(add) is not bool or not EMAIL.fullmatch(member or ''):
+        raise ValueError('Invalid distribution list change')
+    return {'member': member, 'add': add}
 
 
 MARKER = b'@@M365@@'
@@ -230,14 +251,25 @@ class Exchange:
         return self.sessions[key]
 
     async def run(self, tenant, action, target='', extra=None):
-        if action not in ('list_mailboxes', 'get_mailbox', 'convert_shared', 'mailbox_permissions', 'set_mailbox_permission'):
+        if action not in ('list_mailboxes', 'get_mailbox', 'convert_shared', 'mailbox_permissions', 'set_mailbox_permission',
+                          'set_distribution_member', 'find_calendar_folders'):
             raise ValueError('Unsupported Exchange operation')
         if not self.client_id:
             raise RuntimeError('Entra app client_id is not configured')
         request = {'action': action, 'target': ''}
         if target:
             request.update(mailbox_reference(target))
-        if extra:
+        if action == 'set_distribution_member':
+            request.update(validate_member(extra or {}))
+        elif action == 'find_calendar_folders':
+            query = (extra or {}).get('query', '')
+            if not QUERY.fullmatch(query):
+                raise ValueError('Search text: 3-64 letters, digits, spaces, dots, hyphens or underscores')
+            request['query'] = query
+        elif action == 'mailbox_permissions':
+            if extra and extra.get('folder'):
+                request['folder'] = validate_folder(extra['folder'])
+        elif extra:
             request.update(validate_permission(extra))
         if self.reaper is None or self.reaper.done():
             self.reaper = asyncio.create_task(self.reap())
@@ -246,17 +278,17 @@ class Exchange:
                 session = await self.session(tenant)
                 session.users += 1
             try:
-                return await self.call(session, tenant, request)
+                return await self.call(session, tenant, request, 900 if action == 'find_calendar_folders' else 180)
             finally:
                 session.users -= 1
 
-    async def call(self, session, tenant, request):
+    async def call(self, session, tenant, request, timeout=180):
         async with session.lock:
             session.used = time.monotonic()
             try:
                 session.proc.stdin.write(json.dumps(request).encode() + b'\n')
                 await session.proc.stdin.drain()
-                reply = await asyncio.wait_for(session.receive(), timeout=180)
+                reply = await asyncio.wait_for(session.receive(), timeout=timeout)
             except BaseException:
                 # State of the remote call is unknown; never reuse this process.
                 if session.proc.returncode is None:

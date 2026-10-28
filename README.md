@@ -20,10 +20,12 @@ Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft G
 | `list_licenses` | Abonnierte Lizenz-SKUs und Verbrauch |
 | `list_mailboxes` | Erste maximal 100 Exchange-Postfächer |
 | `get_mailbox` | Einzelnes Postfach über Entra-Objekt-ID oder SMTP-Adresse (auch freigegebene Postfächer und Räume) |
-| `get_mailbox_permissions` | Vollzugriff, Senden-als und Berechtigungen des Standardkalenders eines Postfachs |
+| `get_mailbox_permissions` | Vollzugriff, Senden-als und Kalenderberechtigungen eines Postfachs (Standardkalender oder bestimmter Kalenderordner) |
+| `find_calendar_folders` | Kalenderordner nach Namen in allen Benutzer-, freigegebenen und Raumpostfächern suchen |
 | `prepare_mailbox_permission` | Plan zum Vergeben/Entfernen von Vollzugriff (mit Automapping), Senden-als oder Kalenderrecht (Reviewer, Author, Editor) |
 | `prepare_change` | Änderungsplan für `block_signin`, `revoke_sessions` oder `convert_shared` |
 | `prepare_license_change` | Plan zum Zuweisen/Entfernen direkter Benutzerlizenzen |
+| `prepare_distribution_membership` | Plan zum Hinzufügen/Entfernen eines Benutzers in einer Cloud-Verteilerliste (über Exchange) |
 | `prepare_group_membership` | Plan zum Hinzufügen/Entfernen eines Benutzers in einer statischen Cloud-Gruppe |
 | `execute_plan` | Einmalige Ausführung nach Bestätigung; Plan verfällt nach zehn Minuten |
 | `get_audit_log` | Audit-Log der freigegebenen Tenants, neueste zuerst; Filter nach Tenant, Aktion, Stunden |

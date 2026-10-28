@@ -1,0 +1,19 @@
+{
+  "client_id": "00000000-0000-0000-0000-000000000001",
+  "tenants": [
+    {
+      "alias": "kunde-a",
+      "tenant_id": "00000000-0000-0000-0000-000000000002",
+      "organization": "kundeinitial.onmicrosoft.com",
+      "writes": false
+    }
+  ],
+  "clients": [
+    {
+      "name": "operator-1",
+      "token_sha256": "REPLACE_WITH_64_CHARACTER_SHA256_HEX_DIGEST",
+      "tenants": ["kunde-a"],
+      "can_write": false
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "m365-cloud-mcp"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["mcp>=1.20,<2", "msal>=1.34,<2", "cryptography>=46,<47", "httpx>=0.28,<1"]
+
+[project.scripts]
+m365-mcp = "m365_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

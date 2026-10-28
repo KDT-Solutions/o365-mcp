@@ -1,0 +1,223 @@
+import contextvars
+import json
+import os
+from pathlib import Path
+import uuid
+
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
+import uvicorn
+
+from .core import Registry, Store
+from .providers import Exchange, Graph
+
+actor = contextvars.ContextVar('actor')
+
+
+class Authentication:
+    def __init__(self, app, registry):
+        self.app, self.registry = app, registry
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http' or scope['path'] == '/healthz':
+            return await self.app(scope, receive, send)
+        header = dict(scope['headers']).get(b'authorization', b'').decode('latin1')
+        client = self.registry.authenticate(header[7:]) if header.startswith('Bearer ') else None
+        if client is None:
+            return await JSONResponse({'error': 'unauthorized'}, status_code=401)(scope, receive, send)
+        marker = actor.set(client)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            actor.reset(marker)
+
+
+def create_app(config_path=None, state_path=None, graph=None, exchange=None):
+    registry = Registry(config_path or os.environ.get('CONFIG_PATH', '/config/tenants.json'))
+    state_path = state_path or os.environ.get('STATE_PATH', '/data/state.db')
+    Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+    store = Store(state_path)
+    pfx = os.environ.get('CERTIFICATE_PATH', '/run/secrets/m365.pfx')
+    password = os.environ.get('CERTIFICATE_PASSWORD_FILE', '/run/secrets/pfx_password')
+    graph = graph or Graph(registry.client_id, pfx, password)
+    exchange = exchange or Exchange(registry.client_id, pfx, password, os.environ.get('EXCHANGE_SCRIPT', '/app/scripts/exchange.ps1'))
+    allowed_hosts = os.environ.get('ALLOWED_HOSTS', 'localhost:*,127.0.0.1:*').split(',')
+    mcp = FastMCP('Microsoft 365 Customer Administration', stateless_http=True, json_response=True,
+                  transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
+                      allowed_hosts=allowed_hosts, allowed_origins=os.environ.get('ALLOWED_ORIGINS', '').split(',') if os.environ.get('ALLOWED_ORIGINS') else []))
+
+    def authorize(alias, write=False):
+        return registry.authorize(actor.get(), alias, write)
+
+    async def read(alias, action, operation, target=''):
+        tenant = authorize(alias)
+        name = actor.get()['name']
+        store.audit(name, alias, action, target, 'started')
+        try:
+            result = await operation(tenant)
+        except Exception:
+            store.audit(name, alias, action, target, 'failed')
+            raise RuntimeError('Provider operation failed. Check tenant permissions and service configuration.') from None
+        store.audit(name, alias, action, target, 'succeeded')
+        return result
+
+    @mcp.tool(annotations={'readOnlyHint': True, 'openWorldHint': False})
+    def list_tenants() -> list[dict]:
+        """List customer aliases authorized for the authenticated MCP client."""
+        return [{'alias': t.alias, 'tenant_id': t.tenant_id, 'writes_enabled': t.writes and actor.get().get('can_write', False)}
+                for t in registry.tenants.values() if t.alias in actor.get()['tenants']]
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_users(tenant: str, limit: int = 100) -> dict:
+        """Read the first 1–999 users. Reports whether additional pages exist."""
+        return await read(tenant, 'list_users', lambda t: graph.listing(t, 'users', 'id,displayName,userPrincipalName,accountEnabled,assignedLicenses', limit))
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_groups(tenant: str, limit: int = 100) -> dict:
+        """Read the first 1–999 groups."""
+        return await read(tenant, 'list_groups', lambda t: graph.listing(t, 'groups', 'id,displayName,mail,groupTypes', limit))
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_licenses(tenant: str) -> dict:
+        """Read subscribed license SKUs and consumption."""
+        return await read(tenant, 'list_licenses', lambda t: graph.request(t, 'subscribedSkus'))
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def get_user(tenant: str, user_id: str) -> dict:
+        """Read one user, assigned licenses and usage location by Entra object UUID."""
+        user_id = str(uuid.UUID(user_id))
+        return await read(tenant, 'get_user', lambda t: graph.request(t, f'users/{user_id}',
+            {'$select': 'id,displayName,userPrincipalName,accountEnabled,usageLocation,assignedLicenses'}), user_id)
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_group_members(tenant: str, group_id: str, limit: int = 100) -> dict:
+        """Read a bounded first page of group members by group UUID."""
+        group_id = str(uuid.UUID(group_id))
+        return await read(tenant, 'list_group_members', lambda t: graph.listing(t,
+            f'groups/{group_id}/members', 'id,displayName', limit), group_id)
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_user_teams(tenant: str, user_id: str) -> dict:
+        """Read Teams joined by a user; requires Team.ReadBasic.All. Does not read telephony settings."""
+        user_id = str(uuid.UUID(user_id))
+        return await read(tenant, 'list_user_teams', lambda t: graph.request(t,
+            f'users/{user_id}/joinedTeams', {'$select': 'id,displayName,description'}), user_id)
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def prepare_license_change(tenant: str, user_id: str, add_sku_ids: list[str], remove_sku_ids: list[str]) -> dict:
+        """Prepare direct license assignment/removal. Review exact SKU IDs and effects before confirming. Added SKUs enable all service plans. Group-based licensing is not removed by this tool. Usage location, capacity and mailbox retention requirements must be checked."""
+        authorize(tenant, write=True)
+        user_id = str(uuid.UUID(user_id))
+        adds = [str(uuid.UUID(value)) for value in add_sku_ids]
+        removes = [str(uuid.UUID(value)) for value in remove_sku_ids]
+        if not (adds or removes) or len(adds) != len(set(adds)) or len(removes) != len(set(removes)) or set(adds) & set(removes):
+            raise ValueError('Provide unique, disjoint add/remove SKU IDs')
+        user = await read(tenant, 'resolve_license_target', lambda t: graph.request(t, f'users/{user_id}',
+            {'$select': 'id,displayName,userPrincipalName,usageLocation,assignedLicenses'}), user_id)
+        inventory = await read(tenant, 'resolve_license_inventory', lambda t: graph.request(t, 'subscribedSkus'))
+        sku_names = {item['skuId']: item['skuPartNumber'] for item in inventory.get('value', [])}
+        if not set(adds + removes) <= sku_names.keys():
+            raise ValueError('SKU not present in customer inventory')
+        if adds and not user.get('usageLocation'):
+            raise ValueError('Set the user usageLocation before assigning licenses')
+        payload = {'addLicenses': [{'skuId': value, 'disabledPlans': []} for value in adds], 'removeLicenses': removes}
+        plan = store.plan(actor.get()['name'], tenant, 'assign_licenses', user_id, payload)
+        plan.update({'resolved_user': user, 'add_skus': {s: sku_names[s] for s in adds},
+                     'remove_skus': {s: sku_names[s] for s in removes},
+                     'warning': 'License removal may affect mailbox/data access. No retention or mailbox conversion is performed.'})
+        store.audit(actor.get()['name'], tenant, 'assign_licenses', user_id, 'planned')
+        return plan
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def prepare_group_membership(tenant: str, group_id: str, user_id: str, add: bool) -> dict:
+        """Prepare adding/removing a user in a static cloud-managed security or Microsoft 365 group. Group licensing may change. Membership of a Microsoft 365 group can affect Teams access; this does not manage Teams channels or telephony."""
+        authorize(tenant, write=True)
+        group_id, user_id = str(uuid.UUID(group_id)), str(uuid.UUID(user_id))
+        group = await read(tenant, 'resolve_group', lambda t: graph.request(t, f'groups/{group_id}',
+            {'$select': 'id,displayName,groupTypes,mailEnabled,securityEnabled,onPremisesSyncEnabled,isAssignableToRole'}), group_id)
+        if 'DynamicMembership' in group.get('groupTypes', []) or group.get('onPremisesSyncEnabled') or group.get('isAssignableToRole'):
+            raise ValueError('Dynamic, synchronized and role-assignable groups are not supported')
+        if group.get('mailEnabled') and 'Unified' not in group.get('groupTypes', []):
+            raise ValueError('Distribution and mail-enabled security groups require Exchange management')
+        if 'Unified' not in group.get('groupTypes', []) and not group.get('securityEnabled'):
+            raise ValueError('Only security and Microsoft 365 groups are supported')
+        user = await read(tenant, 'resolve_group_member', lambda t: graph.request(t, f'users/{user_id}',
+            {'$select': 'id,displayName,userPrincipalName'}), user_id)
+        action = 'add_group_member' if add else 'remove_group_member'
+        plan = store.plan(actor.get()['name'], tenant, action, group_id, {'member_id': user_id})
+        plan.update({'resolved_group': group, 'resolved_user': user})
+        store.audit(actor.get()['name'], tenant, action, group_id, 'planned')
+        return plan
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_mailboxes(tenant: str) -> dict:
+        """Read at most 100 Exchange mailboxes. This is a bounded inventory, not a full export."""
+        items = await read(tenant, 'list_mailboxes', lambda t: exchange.run(t, 'list_mailboxes'))
+        return {'items': items, 'limit': 100, 'may_be_truncated': len(items) >= 100}
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def get_mailbox(tenant: str, user_id: str) -> dict:
+        """Read one Exchange mailbox by its Entra user object UUID."""
+        user_id = str(uuid.UUID(user_id))
+        return await read(tenant, 'get_mailbox', lambda t: exchange.run(t, 'get_mailbox', user_id), user_id)
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def prepare_change(tenant: str, action: str, user_id: str) -> dict:
+        """Prepare, but do not execute, block_signin, revoke_sessions or convert_shared. Show the plan to the operator and obtain explicit confirmation before execute_plan. Session revocation is not immediate for every token. This is not complete offboarding."""
+        authorize(tenant, write=True)
+        if action not in ('block_signin', 'revoke_sessions', 'convert_shared'):
+            raise ValueError('Supported actions: block_signin, revoke_sessions, convert_shared')
+        user_id = str(uuid.UUID(user_id))
+        target = await read(tenant, 'resolve_change_target', lambda t: graph.request(t, f'users/{user_id}', {'$select': 'id,displayName,userPrincipalName'}), user_id)
+        if action == 'convert_shared':
+            await read(tenant, 'resolve_mailbox', lambda t: exchange.run(t, 'get_mailbox', user_id), user_id)
+        result = store.plan(actor.get()['name'], tenant, action, user_id)
+        result['resolved_user'] = target
+        if action == 'convert_shared':
+            result['prerequisites'] = 'Check hybrid source of authority, mailbox size, archive, holds, retention and licensing. This tool does not remove licenses.'
+        store.audit(actor.get()['name'], tenant, action, user_id, 'planned')
+        return result
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': True, 'idempotentHint': False})
+    async def execute_plan(tenant: str, plan_id: str, confirmed: bool = False) -> dict:
+        """Execute a reviewed plan once, only after explicit operator confirmation. confirmed must be true. On timeout/failure read remote state before preparing another plan."""
+        customer = authorize(tenant, write=True)
+        if confirmed is not True:
+            raise ValueError('Explicit confirmation required')
+        name = actor.get()['name']
+        action, target = store.claim(plan_id, name, tenant)
+        store.audit(name, tenant, action, target, 'executing')
+        try:
+            if action == 'block_signin':
+                result = await graph.block(customer, target)
+            elif action == 'convert_shared':
+                result = await exchange.run(customer, action, target)
+            elif action in ('assign_licenses', 'revoke_sessions', 'add_group_member', 'remove_group_member'):
+                result = await graph.admin_change(customer, action, target, store.payload(plan_id))
+            else:
+                raise ValueError('Unsupported stored action')
+        except BaseException:
+            store.finish(plan_id, 'unknown')
+            store.audit(name, tenant, action, target, 'unknown_verify_remote_state')
+            raise RuntimeError('Execution did not complete cleanly. Plan is consumed. Check remote state before retrying.') from None
+        store.finish(plan_id, 'succeeded')
+        store.audit(name, tenant, action, target, 'succeeded')
+        return {'tenant': tenant, 'action': action, 'target': target, 'result': result}
+
+    async def health(_):
+        return JSONResponse({'status': 'ok'})
+
+    transport = mcp.streamable_http_app()
+    app = Starlette(routes=[Route('/healthz', health), Mount('/', app=transport)], lifespan=transport.router.lifespan_context)
+    return Authentication(app, registry)
+
+
+def main():
+    uvicorn.run(create_app(), host='0.0.0.0', port=8000, access_log=False, proxy_headers=False)
+
+
+if __name__ == '__main__':
+    main()

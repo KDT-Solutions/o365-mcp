@@ -1,0 +1,40 @@
+# Portainer Git stack (Docker Standalone). Portainer clones this repository
+# and builds the image on the target Docker host from the Dockerfile.
+services:
+  m365-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${MCP_IMAGE:-m365-cloud-mcp:local}
+    pull_policy: build
+    restart: unless-stopped
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      CONFIG_PATH: /config/tenants.json
+      STATE_PATH: /data/state.db
+      CERTIFICATE_PATH: /run/secrets/m365.pfx
+      CERTIFICATE_PASSWORD_FILE: /run/secrets/pfx_password
+      ALLOWED_HOSTS: ${MCP_HOST:?Set MCP_HOST to your public DNS name},localhost:*,127.0.0.1:*
+      ALLOWED_ORIGINS: https://${MCP_HOST}
+      HOME: /home/mcp
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8085}:8000"
+    volumes:
+      - ${MCP_CONFIG_DIR:?Set MCP_CONFIG_DIR}/tenants.json:/config/tenants.json:ro
+      - ${MCP_SECRET_DIR:?Set MCP_SECRET_DIR}/m365.pfx:/run/secrets/m365.pfx:ro
+      - ${MCP_SECRET_DIR}/pfx_password:/run/secrets/pfx_password:ro
+      - m365_data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=10001,gid=10001
+      - /home/mcp:rw,nosuid,size=128m,uid=10001,gid=10001
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 128
+    stop_grace_period: 30s
+volumes:
+  m365_data:

@@ -1,0 +1,14 @@
+.venv
+.git
+__pycache__
+.pytest_cache
+*.egg-info
+*.pfx
+*.pem
+*.key
+*.db*
+.env
+config/tenants.json
+secrets
+build
+dist

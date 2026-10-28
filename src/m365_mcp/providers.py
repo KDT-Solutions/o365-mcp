@@ -45,6 +45,8 @@ class Graph:
         }
         self.client_id = client_id
         self.apps = {}
+        # Short-lived per-user OneDrive inventories (10 minutes) for repeated searches.
+        self.inventories = {}
 
     def token(self, tenant):
         if not self.client_id:
@@ -73,6 +75,35 @@ class Graph:
                 if response.is_error:
                     raise RuntimeError(f'Graph HTTP {response.status_code}; request-id={response.headers.get("request-id", "unknown")}')
                 return response.json() if response.content else {'success': True}
+
+    async def request_link(self, tenant, link):
+        """Follow a Graph paging link (@odata.nextLink) returned by Graph itself; any other host or API version is refused."""
+        prefix = 'https://graph.microsoft.com/v1.0/'
+        if not isinstance(link, str) or not link.startswith(prefix):
+            raise ValueError('Unexpected paging link')
+        return await self.request(tenant, link[len(prefix):])
+
+    async def drive_inventory(self, tenant, user_id, max_items=50000):
+        """All items of a user's OneDrive as a flat list via the delta query (works with app-only access)."""
+        user_id = str(uuid.UUID(user_id))
+        key = (tenant.tenant_id, user_id)
+        cached = self.inventories.get(key)
+        if cached and time.monotonic() - cached[0] < 600:
+            return cached[1], cached[2]
+        data = await self.request(tenant, f'users/{user_id}/drive/root/delta',
+                                  {'$select': 'id,name,size,createdDateTime,lastModifiedDateTime,file,folder,parentReference,deleted'})
+        items, complete = [], True
+        while True:
+            items.extend(i for i in data.get('value', []) if 'deleted' not in i)
+            link = data.get('@odata.nextLink')
+            if not link:
+                break
+            if len(items) >= max_items:
+                complete = False
+                break
+            data = await self.request_link(tenant, link)
+        self.inventories[key] = (time.monotonic(), items, complete)
+        return items, complete
 
     async def listing(self, tenant, resource, select, limit=100):
         if type(limit) is not int or not 1 <= limit <= 999:

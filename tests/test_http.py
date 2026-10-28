@@ -319,6 +319,13 @@ def test_file_share_plan(config, tmp_path, monkeypatch):
                 assert (await tool('find_user_files', {'tenant': 'alpha', 'user_id': user, 'query': "x') or ('"}))[0]['isError']
                 _, found = await tool('find_user_files', {'tenant': 'alpha', 'user_id': user, 'query': 'Xylem'})
                 assert [i['path'] for i in found['items']] == ['/Recordings/Xylem Meeting.mp4'] and found['scanned'] == 3
+                assert found['method'] == 'folder_walk'
+                async def inventory(t, uid):
+                    return [{'id': '01ABC!12', 'name': 'Xylem Meeting.mp4', 'parentReference': {'path': '/drive/root:/Recordings'}, 'file': {}},
+                            {'id': '01OTHER', 'name': 'Notes.docx', 'parentReference': {'path': '/drive/root:'}, 'file': {}}], True
+                graph.drive_inventory = inventory
+                _, found = await tool('find_user_files', {'tenant': 'alpha', 'user_id': user, 'query': 'xylem'})
+                assert found['method'] == 'delta' and [i['path'] for i in found['items']] == ['/Recordings/Xylem Meeting.mp4']
                 assert (await tool('prepare_file_share', {'tenant': 'alpha', 'owner_user_id': user, 'item_id': '../x', 'recipient_user_id': user}))[0]['isError']
                 _, plan = await tool('prepare_file_share', {'tenant': 'alpha', 'owner_user_id': user, 'item_id': '01ABC!12',
                                                             'recipient_user_id': user, 'role': 'write'})

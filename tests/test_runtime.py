@@ -173,3 +173,11 @@ def test_folder_and_query_validation(tmp_path, monkeypatch):
 
     asyncio.run(scenario())
     assert 'call find_calendar_folders' in log.read_text()
+
+
+def test_paging_link_must_stay_on_graph():
+    from m365_mcp.providers import Graph
+    graph = Graph.__new__(Graph)
+    for bad in ('https://evil.example/v1.0/users', 'https://graph.microsoft.com/beta/users', None):
+        with pytest.raises(ValueError):
+            asyncio.run(graph.request_link(tenant('alpha', 2), bad))

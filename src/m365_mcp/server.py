@@ -338,11 +338,27 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
 
     @mcp.tool(annotations={'readOnlyHint': True})
     async def find_user_files(tenant: str, user_id: str, query: str) -> dict:
-        """Find files and folders in a user's OneDrive whose name contains query (case-insensitive), e.g. a Teams recording. Walks the folder tree (max. depth 8, max. 5000 entries) because Graph's drive search does not support app-only access. query: 2-64 letters, digits, spaces, dots, hyphens."""
+        """Find files and folders in a user's OneDrive whose name contains query (case-insensitive), e.g. a Teams recording. Uses the OneDrive delta inventory (cached 10 minutes per user; falls back to a bounded folder walk) because Graph's drive search does not support app-only access. query: 2-64 letters, digits, spaces, dots, hyphens."""
         user_id = str(uuid.UUID(user_id))
         if not FILE_QUERY.fullmatch(query or ''):
             raise ValueError('query: 2-64 letters, digits, spaces, dots, hyphens or underscores')
         needle = query.lower()
+
+        def entry(item, path):
+            return {'id': item.get('id'), 'name': item.get('name'), 'path': path, 'size': item.get('size'),
+                    'created': item.get('createdDateTime'), 'modified': item.get('lastModifiedDateTime'),
+                    'is_folder': 'folder' in item}
+
+        async def delta(t):
+            items, complete = await graph.drive_inventory(t, user_id)
+            hits = []
+            for item in items:
+                name = item.get('name', '')
+                if needle in name.lower():
+                    parent = (item.get('parentReference') or {}).get('path', '')
+                    folder = parent.split('root:', 1)[1] if 'root:' in parent else ''
+                    hits.append(entry(item, f'{folder}/{name}'))
+            return hits, len(items), not complete
 
         async def walk(t):
             hits, scanned, pending = [], 0, [('', f'users/{user_id}/drive/root/children', 0)]
@@ -356,17 +372,21 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                     name = item.get('name', '')
                     full = f'{path}/{name}'
                     if needle in name.lower():
-                        hits.append({'id': item.get('id'), 'name': name, 'path': full, 'size': item.get('size'),
-                                     'created': item.get('createdDateTime'), 'modified': item.get('lastModifiedDateTime'),
-                                     'is_folder': 'folder' in item})
+                        hits.append(entry(item, full))
                     if 'folder' in item and depth < 8 and ITEM_ID.fullmatch(item.get('id', '')):
                         pending.append((full, f"users/{user_id}/drive/items/{item['id']}/children", depth + 1))
                     if scanned >= 5000:
                         return hits, scanned, True
             return hits, scanned, truncated
 
-        hits, scanned, truncated = await read(tenant, 'find_user_files', walk, user_id)
-        return {'items': hits[:200], 'scanned': scanned, 'incomplete': truncated or len(hits) > 200}
+        try:
+            hits, scanned, truncated = await read(tenant, 'find_user_files', delta, user_id)
+            method = 'delta'
+        except RuntimeError:
+            # Fallback for tenants where the delta query is not available.
+            hits, scanned, truncated = await read(tenant, 'find_user_files_walk', walk, user_id)
+            method = 'folder_walk'
+        return {'items': hits[:200], 'scanned': scanned, 'incomplete': truncated or len(hits) > 200, 'method': method}
 
     @mcp.tool(annotations={'readOnlyHint': True})
     async def list_user_folder(tenant: str, user_id: str, folder: str = '') -> dict:

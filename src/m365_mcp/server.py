@@ -22,6 +22,7 @@ from .providers import ExchangeError, CALENDAR_ROLES, MAILBOX_RIGHTS, Exchange, 
 actor = contextvars.ContextVar('actor')
 FILE_QUERY = re.compile(r'[\w .-]{2,64}')
 ITEM_ID = re.compile(r'[A-Za-z0-9!_-]{1,128}')
+DRIVE_PATH = re.compile(r'[\w .-]{1,100}(/[\w .-]{1,100}){0,9}')
 PUBLIC_PATHS = ('/healthz', '/consent-done')
 # Static page after Microsoft admin consent. Query parameters are deliberately ignored:
 # nothing from the callback is trusted, reflected or stored.
@@ -347,6 +348,20 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                   'modified': i.get('lastModifiedDateTime'), 'folder_path': (i.get('parentReference') or {}).get('path'),
                   'is_folder': 'folder' in i} for i in data.get('value', [])]
         return {'items': items, 'more_available': '@odata.nextLink' in data}
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_user_folder(tenant: str, user_id: str, folder: str = '') -> dict:
+        """List up to 200 entries of a folder in a user's OneDrive. folder: path below the drive root such as Recordings or Documents/Projekte; empty = root. Teams recordings are usually in Recordings (German: Aufzeichnungen)."""
+        user_id = str(uuid.UUID(user_id))
+        folder = (folder or '').strip('/')
+        if folder and not DRIVE_PATH.fullmatch(folder):
+            raise ValueError('folder: letters, digits, spaces, dots, hyphens, underscores and / only')
+        path = f'users/{user_id}/drive/root/children' if not folder else f'users/{user_id}/drive/root:/{folder}:/children'
+        data = await read(tenant, 'list_user_folder', lambda t: graph.request(t, path,
+            {'$select': 'id,name,size,createdDateTime,lastModifiedDateTime,file,folder', '$top': '200'}), user_id)
+        items = [{'id': i.get('id'), 'name': i.get('name'), 'size': i.get('size'), 'created': i.get('createdDateTime'),
+                  'modified': i.get('lastModifiedDateTime'), 'is_folder': 'folder' in i} for i in data.get('value', [])]
+        return {'folder': '/' + folder, 'items': items, 'more_available': '@odata.nextLink' in data}
 
     @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
     async def prepare_file_share(tenant: str, owner_user_id: str, item_id: str, recipient_user_id: str, role: str = 'read') -> dict:

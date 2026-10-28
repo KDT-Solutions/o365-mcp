@@ -41,10 +41,12 @@ $ownErrors = @('Invalid mailbox', 'Invalid folder path', 'Calendar folder not fo
 function Get-Reason($record) {
     $id = [string]$record.FullyQualifiedErrorId
     if ($ownErrors -contains $record.Exception.Message) { return $record.Exception.Message }
+    # Name of the failing cmdlet (e.g. Get MailboxFolderPermission) plus the exception type; no message text.
+    $command = ([string]$record.InvocationInfo.MyCommand.Name) -replace '[^A-Za-z]', ' '
     foreach ($text in @($id, [string]$record.Exception.Message)) {
-        if ($text -match '([A-Za-z]{3,60}Exception)') { return $Matches[1] }
+        if ($text -match '([A-Za-z]{3,60}Exception)') { return ($command + ' ' + $Matches[1]).Trim() }
     }
-    return $record.Exception.GetType().Name
+    return ($command + ' ' + $record.Exception.GetType().Name).Trim()
 }
 
 $connected = $false

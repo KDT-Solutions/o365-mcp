@@ -96,7 +96,8 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
             result = await operation(tenant)
         except Exception as error:
             store.audit(name, alias, action, target, 'failed', elapsed(started))
-            if isinstance(error, ExchangeError):
+            if isinstance(error, ExchangeError) or str(error).startswith('Graph HTTP '):
+                # Both carry only a status code or exception type and a request id, never response content.
                 raise RuntimeError(str(error)) from None
             raise RuntimeError('Provider operation failed. Check tenant permissions and service configuration.') from None
         store.audit(name, alias, action, target, 'succeeded', elapsed(started))

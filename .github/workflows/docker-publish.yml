@@ -38,7 +38,7 @@ jobs:
         with:
           images: ghcr.io/kdt-solutions/o365-mcp
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=short
             type=ref,event=tag
 

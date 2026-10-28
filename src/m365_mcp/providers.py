@@ -104,6 +104,16 @@ class Graph:
             raise RuntimeError('Unexpected organization response')
         return items[0]
 
+    async def share_file(self, tenant, payload):
+        """Grant a user access to one drive item without sending an invitation e-mail."""
+        owner = str(uuid.UUID(payload['owner']))
+        item_id, recipient, role = payload['item_id'], payload['recipient'], payload['role']
+        if not re.fullmatch(r'[A-Za-z0-9!_-]{1,128}', item_id) or not EMAIL.fullmatch(recipient) or role not in ('read', 'write'):
+            raise ValueError('Invalid share request')
+        result = await self.request(tenant, f'users/{owner}/drive/items/{item_id}/invite', method='POST', body={
+            'recipients': [{'email': recipient}], 'requireSignIn': True, 'sendInvitation': False, 'roles': [role]})
+        return {'shared_with': recipient, 'role': role, 'permissions': len(result.get('value', []))}
+
     async def block(self, tenant, target):
         target = str(uuid.UUID(target))
         return await self.request(tenant, f'users/{target}', body={'accountEnabled': False})

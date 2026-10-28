@@ -20,6 +20,8 @@ Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft G
 | `list_licenses` | Abonnierte Lizenz-SKUs und Verbrauch |
 | `list_mailboxes` | Erste maximal 100 Exchange-Postfächer |
 | `get_mailbox` | Einzelnes Postfach über Entra-Objekt-ID oder SMTP-Adresse (auch freigegebene Postfächer und Räume) |
+| `find_user_files` | Dateien im OneDrive eines Benutzers suchen (z.B. Teams-Aufzeichnungen) |
+| `prepare_file_share` | Plan, eine Datei aus einem OneDrive mit einem Benutzer desselben Tenants zu teilen (ohne Einladungsmail) |
 | `get_mailbox_permissions` | Vollzugriff, Senden-als und Kalenderberechtigungen eines Postfachs (Standardkalender oder bestimmter Kalenderordner) |
 | `find_calendar_folders` | Kalenderordner nach Namen in allen Benutzer-, freigegebenen und Raumpostfächern suchen |
 | `prepare_mailbox_permission` | Plan zum Vergeben/Entfernen von Vollzugriff (mit Automapping), Senden-als oder Kalenderrecht (Reviewer, Author, Editor) |
@@ -52,6 +54,7 @@ Schreibzugriff ist in der Beispielkonfiguration abgeschaltet. Für den ersten Te
 | Direkte Benutzerlizenzen ändern, optional | Zusätzlich `LicenseAssignment.ReadWrite.All` |
 | Gruppenmitgliedschaft ändern, optional | Zusätzlich `GroupMember.ReadWrite.All` |
 | Teams-Mitgliedschaften lesen, optional | `Team.ReadBasic.All` |
+| OneDrive-Dateien suchen und teilen, optional | `Files.ReadWrite.All` (Zugriff auf alle Dateien des Tenants) |
 | Sitzungen widerrufen, optional | `User.RevokeSessions.All` |
 
 Nur benötigte Rechte konfigurieren. Änderungen an privilegierten Administratorkonten unterliegen zusätzlichen Microsoft-Einschränkungen; ein erfolgreiches Consent bedeutet nicht, dass jede Kontosperrung zulässig ist.

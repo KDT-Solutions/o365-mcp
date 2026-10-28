@@ -3,6 +3,7 @@ from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 import os
 from pathlib import Path
+import re
 import time
 from urllib.parse import urlencode
 import uuid
@@ -19,6 +20,8 @@ from .core import ALIAS, Registry, Store, Tenant
 from .providers import ExchangeError, CALENDAR_ROLES, MAILBOX_RIGHTS, Exchange, Graph, mailbox_reference, validate_folder
 
 actor = contextvars.ContextVar('actor')
+FILE_QUERY = re.compile(r'[\w .-]{2,64}')
+ITEM_ID = re.compile(r'[A-Za-z0-9!_-]{1,128}')
 PUBLIC_PATHS = ('/healthz', '/consent-done')
 # Static page after Microsoft admin consent. Query parameters are deliberately ignored:
 # nothing from the callback is trusted, reflected or stored.
@@ -327,6 +330,43 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         return plan
 
     @mcp.tool(annotations={'readOnlyHint': True})
+    async def find_user_files(tenant: str, user_id: str, query: str) -> dict:
+        """Search a user's OneDrive by file name/content (e.g. a Teams meeting recording in the Recordings folder). query: 2-64 letters, digits, spaces, dots, hyphens. Requires Files.ReadWrite.All or Files.Read.All. Returns at most 50 hits."""
+        user_id = str(uuid.UUID(user_id))
+        if not FILE_QUERY.fullmatch(query or ''):
+            raise ValueError('query: 2-64 letters, digits, spaces, dots, hyphens or underscores')
+        data = await read(tenant, 'find_user_files', lambda t: graph.request(t, f"users/{user_id}/drive/root/search(q='{query}')",
+            {'$select': 'id,name,size,createdDateTime,lastModifiedDateTime,parentReference,file,folder', '$top': '50'}), user_id)
+        items = [{'id': i.get('id'), 'name': i.get('name'), 'size': i.get('size'), 'created': i.get('createdDateTime'),
+                  'modified': i.get('lastModifiedDateTime'), 'folder_path': (i.get('parentReference') or {}).get('path'),
+                  'is_folder': 'folder' in i} for i in data.get('value', [])]
+        return {'items': items, 'more_available': '@odata.nextLink' in data}
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def prepare_file_share(tenant: str, owner_user_id: str, item_id: str, recipient_user_id: str, role: str = 'read') -> dict:
+        """Prepare sharing one file/folder from a user's OneDrive with another user of the same tenant (role read or write; write also allows download for Teams recordings). No invitation e-mail is sent; the recipient finds it under 'Shared with me'. Confirm with execute_plan."""
+        authorize(tenant, write=True)
+        if role not in ('read', 'write'):
+            raise ValueError('role must be read or write')
+        owner, recipient = str(uuid.UUID(owner_user_id)), str(uuid.UUID(recipient_user_id))
+        if not ITEM_ID.fullmatch(item_id or ''):
+            raise ValueError('Invalid drive item id (use an id from find_user_files)')
+        item = await read(tenant, 'resolve_file', lambda t: graph.request(t, f'users/{owner}/drive/items/{item_id}',
+            {'$select': 'id,name,size,parentReference,file,folder'}), item_id)
+        user = await read(tenant, 'resolve_share_recipient', lambda t: graph.request(t, f'users/{recipient}',
+            {'$select': 'id,displayName,userPrincipalName,mail'}), recipient)
+        address = str(user.get('mail') or user.get('userPrincipalName') or '')
+        if not address:
+            raise ValueError('Recipient has no address')
+        payload = {'owner': owner, 'item_id': item_id, 'recipient': address, 'role': role}
+        plan = store.plan(actor.get()['name'], tenant, 'share_file', item_id, payload)
+        plan.update({'resolved_item': {'name': item.get('name'), 'size': item.get('size'),
+                                       'folder_path': (item.get('parentReference') or {}).get('path')},
+                     'resolved_recipient': user, 'role': role})
+        store.audit(actor.get()['name'], tenant, 'share_file', item_id, 'planned')
+        return plan
+
+    @mcp.tool(annotations={'readOnlyHint': True})
     async def list_mailboxes(tenant: str) -> dict:
         """Read at most 100 Exchange mailboxes. This is a bounded inventory, not a full export."""
         items = await read(tenant, 'list_mailboxes', lambda t: exchange.run(t, 'list_mailboxes'))
@@ -424,6 +464,8 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                 result = await graph.block(customer, target)
             elif action == 'convert_shared':
                 result = await exchange.run(customer, action, target)
+            elif action == 'share_file':
+                result = await graph.share_file(customer, store.payload(plan_id))
             elif action == 'distribution_member':
                 result = await exchange.run(customer, 'set_distribution_member', target, store.payload(plan_id))
             elif action == 'mailbox_permission':

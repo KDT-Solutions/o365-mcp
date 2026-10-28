@@ -281,3 +281,44 @@ def test_distribution_membership_plan(config, tmp_path, monkeypatch):
                 assert exchange.calls[-1] == ('set_distribution_member', 'liste@alpha.example',
                                               {'member': 'test.user@alpha.example', 'member_id': '00000000-0000-0000-0000-000000000005', 'add': False})
     asyncio.run(scenario())
+
+
+def test_file_share_plan(config, tmp_path, monkeypatch):
+    monkeypatch.setenv('ALLOWED_HOSTS', 'testserver')
+    graph, exchange = FakeGraph(), FakeExchange()
+    app = create_app(config, tmp_path / 'state.db', graph, exchange)
+    paths, shares = [], []
+
+    async def request(tenant, path, params=None, body=None):
+        paths.append(path)
+        if '/search(' in path:
+            return {'value': [{'id': '01ABC!12', 'name': 'Meeting.mp4', 'size': 5, 'parentReference': {'path': '/drive/root:/Recordings'}, 'file': {}}]}
+        if '/drive/items/' in path:
+            return {'id': '01ABC!12', 'name': 'Meeting.mp4', 'size': 5, 'parentReference': {'path': '/drive/root:/Recordings'}}
+        return {'id': '00000000-0000-0000-0000-000000000005', 'displayName': 'Test User', 'userPrincipalName': 'test.user@alpha.example'}
+    async def share_file(tenant, payload):
+        shares.append(payload)
+        return {'shared_with': payload['recipient']}
+    graph.request, graph.share_file = request, share_file
+
+    async def scenario():
+        async with app.app.router.lifespan_context(app.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver') as client:
+                headers = {'Authorization': 'Bearer test-token', 'Accept': 'application/json, text/event-stream'}
+                async def tool(name, args):
+                    response = await client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                                                               'params': {'name': name, 'arguments': args}})
+                    result = response.json()['result']
+                    return result, (None if result.get('isError') else json.loads(result['content'][0]['text']))
+                user = '00000000-0000-0000-0000-000000000005'
+                assert (await tool('find_user_files', {'tenant': 'alpha', 'user_id': user, 'query': "x') or ('"}))[0]['isError']
+                _, found = await tool('find_user_files', {'tenant': 'alpha', 'user_id': user, 'query': 'Xylem'})
+                assert found['items'][0]['id'] == '01ABC!12'
+                assert (await tool('prepare_file_share', {'tenant': 'alpha', 'owner_user_id': user, 'item_id': '../x', 'recipient_user_id': user}))[0]['isError']
+                _, plan = await tool('prepare_file_share', {'tenant': 'alpha', 'owner_user_id': user, 'item_id': '01ABC!12',
+                                                            'recipient_user_id': user, 'role': 'write'})
+                assert plan['resolved_item']['name'] == 'Meeting.mp4' and not shares
+                result, _ = await tool('execute_plan', {'tenant': 'alpha', 'plan_id': plan['plan_id'], 'confirmed': True})
+                assert not result.get('isError'), result
+                assert shares == [{'owner': user, 'item_id': '01ABC!12', 'recipient': 'test.user@alpha.example', 'role': 'write'}]
+    asyncio.run(scenario())

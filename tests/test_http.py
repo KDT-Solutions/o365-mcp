@@ -45,7 +45,16 @@ class FakeGraph:
 
 
 class FakeExchange:
-    async def run(self, *args):
+    def __init__(self):
+        self.calls = []
+
+    async def run(self, tenant, action, target='', extra=None):
+        self.calls.append((action, target, extra))
+        if action == 'get_mailbox':
+            return {'DisplayName': 'Jugendfeuerwehr', 'PrimarySmtpAddress': 'jugend@alpha.example',
+                    'RecipientTypeDetails': 'SharedMailbox', 'ExternalDirectoryObjectId': '00000000-0000-0000-0000-000000000009'}
+        if action == 'mailbox_permissions':
+            return {'mailbox': 'jugend@alpha.example', 'full_access': [], 'send_as': [], 'calendar': []}
         return []
 
 
@@ -197,3 +206,44 @@ def test_tenant_management_persists_and_is_restricted(config, tmp_path, monkeypa
     asyncio.run(session(create_app(config, state, provider, FakeExchange()), 'test-token', as_alice))
     asyncio.run(session(create_app(config, state, provider, FakeExchange()), 'bob-token', as_bob))
     asyncio.run(session(create_app(config, state, provider, FakeExchange()), 'test-token', after_restart))
+
+
+def test_mailbox_permission_plan(config, tmp_path, monkeypatch):
+    monkeypatch.setenv('ALLOWED_HOSTS', 'testserver')
+    graph, exchange = FakeGraph(), FakeExchange()
+    app = create_app(config, tmp_path / 'state.db', graph, exchange)
+
+    async def original_request(tenant, path, params=None, body=None):
+        return {'id': '00000000-0000-0000-0000-000000000005', 'displayName': 'Test User', 'userPrincipalName': 'test.user@alpha.example'}
+    graph.request = original_request
+
+    async def scenario():
+        async with app.app.router.lifespan_context(app.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver') as client:
+                headers = {'Authorization': 'Bearer test-token', 'Accept': 'application/json, text/event-stream'}
+                async def tool(name, args):
+                    response = await client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                                                               'params': {'name': name, 'arguments': args}})
+                    result = response.json()['result']
+                    return result, (None if result.get('isError') else json.loads(result['content'][0]['text']))
+                result, permissions = await tool('get_mailbox_permissions', {'tenant': 'alpha', 'mailbox': 'Jugend@alpha.example'})
+                assert permissions['mailbox'] == 'jugend@alpha.example'
+                assert exchange.calls[-1] == ('mailbox_permissions', 'jugend@alpha.example', None)
+                for bad in ('x; Remove-Mailbox', "a'@b.ch", ''):
+                    assert (await tool('get_mailbox_permissions', {'tenant': 'alpha', 'mailbox': bad}))[0]['isError']
+                assert (await tool('get_mailbox_permissions', {'tenant': 'beta', 'mailbox': 'jugend@alpha.example'}))[0]['isError']
+                args = {'tenant': 'alpha', 'mailbox': 'jugend@alpha.example', 'user_id': '00000000-0000-0000-0000-000000000005'}
+                assert (await tool('prepare_mailbox_permission', {**args, 'right': 'owner'}))[0]['isError']
+                assert (await tool('prepare_mailbox_permission', {**args, 'right': 'calendar'}))[0]['isError']
+                calls_before = len(exchange.calls)
+                _, plan = await tool('prepare_mailbox_permission', {**args, 'right': 'full_access'})
+                assert plan['target'] == 'jugend@alpha.example' and plan['change']['automapping'] is True
+                assert not any(c[0] == 'set_mailbox_permission' for c in exchange.calls[calls_before:])
+                result, done = await tool('execute_plan', {'tenant': 'alpha', 'plan_id': plan['plan_id'], 'confirmed': True})
+                assert not result.get('isError'), result
+                action, target, extra = exchange.calls[-1]
+                assert (action, target) == ('set_mailbox_permission', 'jugend@alpha.example')
+                assert extra['right'] == 'full_access' and extra['trustee'] == 'test.user@alpha.example' and extra['add'] is True
+                _, calendar = await tool('prepare_mailbox_permission', {**args, 'right': 'calendar', 'calendar_role': 'Editor'})
+                assert calendar['change']['calendar_role'] == 'Editor'
+    asyncio.run(scenario())

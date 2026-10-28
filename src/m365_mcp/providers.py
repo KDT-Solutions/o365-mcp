@@ -11,6 +11,23 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
 
 
+EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}')
+MAILBOX_RIGHTS = ('full_access', 'send_as', 'calendar')
+CALENDAR_ROLES = ('Reviewer', 'Author', 'Editor')
+
+
+def mailbox_reference(value):
+    """Entra object UUID or SMTP address of a mailbox; anything else is rejected."""
+    value = (value or '').strip()
+    try:
+        return {'target': str(uuid.UUID(value))}
+    except ValueError:
+        pass
+    if len(value) > 254 or not EMAIL.fullmatch(value):
+        raise ValueError('Mailbox must be an Entra object UUID or an SMTP address')
+    return {'mailbox': value.lower()}
+
+
 DOMAIN = re.compile(r'(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}')
 ISSUER = re.compile(r'https://login\.microsoftonline\.com/([0-9a-f-]{36})/v2\.0')
 
@@ -108,6 +125,19 @@ class Graph:
         raise ValueError('Unsupported Graph operation')
 
 
+def validate_permission(payload):
+    """Strictly re-validate a stored permission change before it reaches PowerShell."""
+    right, trustee, add = payload.get('right'), payload.get('trustee'), payload.get('add')
+    if right not in MAILBOX_RIGHTS or type(add) is not bool or not EMAIL.fullmatch(trustee or ''):
+        raise ValueError('Invalid mailbox permission change')
+    result = {'right': right, 'trustee': trustee, 'add': add, 'automapping': payload.get('automapping') is True}
+    if right == 'calendar' and add:
+        if payload.get('role') not in CALENDAR_ROLES:
+            raise ValueError('Calendar role must be Reviewer, Author or Editor')
+        result['role'] = payload['role']
+    return result
+
+
 MARKER = b'@@M365@@'
 
 
@@ -199,13 +229,16 @@ class Exchange:
         self.sessions[key] = await self.start(tenant)
         return self.sessions[key]
 
-    async def run(self, tenant, action, target=''):
-        if action not in ('list_mailboxes', 'get_mailbox', 'convert_shared'):
+    async def run(self, tenant, action, target='', extra=None):
+        if action not in ('list_mailboxes', 'get_mailbox', 'convert_shared', 'mailbox_permissions', 'set_mailbox_permission'):
             raise ValueError('Unsupported Exchange operation')
         if not self.client_id:
             raise RuntimeError('Entra app client_id is not configured')
+        request = {'action': action, 'target': ''}
         if target:
-            target = str(uuid.UUID(target))
+            request.update(mailbox_reference(target))
+        if extra:
+            request.update(validate_permission(extra))
         if self.reaper is None or self.reaper.done():
             self.reaper = asyncio.create_task(self.reap())
         async with self.slots:
@@ -213,15 +246,15 @@ class Exchange:
                 session = await self.session(tenant)
                 session.users += 1
             try:
-                return await self.call(session, tenant, action, target)
+                return await self.call(session, tenant, request)
             finally:
                 session.users -= 1
 
-    async def call(self, session, tenant, action, target):
+    async def call(self, session, tenant, request):
         async with session.lock:
             session.used = time.monotonic()
             try:
-                session.proc.stdin.write(json.dumps({'action': action, 'target': target}).encode() + b'\n')
+                session.proc.stdin.write(json.dumps(request).encode() + b'\n')
                 await session.proc.stdin.drain()
                 reply = await asyncio.wait_for(session.receive(), timeout=180)
             except BaseException:

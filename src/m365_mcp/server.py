@@ -16,7 +16,7 @@ import uvicorn
 
 from .certs import certificate_info, ensure_certificate
 from .core import ALIAS, Registry, Store, Tenant
-from .providers import Exchange, Graph
+from .providers import CALENDAR_ROLES, MAILBOX_RIGHTS, Exchange, Graph, mailbox_reference
 
 actor = contextvars.ContextVar('actor')
 PUBLIC_PATHS = ('/healthz', '/consent-done')
@@ -311,9 +311,50 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
 
     @mcp.tool(annotations={'readOnlyHint': True})
     async def get_mailbox(tenant: str, user_id: str) -> dict:
-        """Read one Exchange mailbox by its Entra user object UUID."""
+        """Read one Exchange mailbox by its Entra object UUID or SMTP address (also shared and room mailboxes)."""
+        reference = next(iter(mailbox_reference(user_id).values()))
+        return await read(tenant, 'get_mailbox', lambda t: exchange.run(t, 'get_mailbox', reference), reference)
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def get_mailbox_permissions(tenant: str, mailbox: str) -> dict:
+        """Read who has full access, send-as and default-calendar permissions on a mailbox (Entra object UUID or SMTP address). Inherited and system entries are omitted. Microsoft 365 group calendars are not covered."""
+        reference = next(iter(mailbox_reference(mailbox).values()))
+        return await read(tenant, 'get_mailbox_permissions', lambda t: exchange.run(t, 'mailbox_permissions', reference), reference)
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def prepare_mailbox_permission(tenant: str, mailbox: str, user_id: str, right: str, add: bool = True,
+                                         calendar_role: str | None = None, automapping: bool = True) -> dict:
+        """Prepare granting or removing a mailbox permission for a user. right: full_access (open the mailbox; automapping adds it to Outlook), send_as, or calendar (default calendar folder; calendar_role Reviewer = read, Author = create own, Editor = edit all). mailbox: Entra object UUID or SMTP address; user_id: Entra user UUID. Confirm with execute_plan."""
+        authorize(tenant, write=True)
+        if right not in MAILBOX_RIGHTS:
+            raise ValueError('right must be full_access, send_as or calendar')
+        if type(add) is not bool or type(automapping) is not bool:
+            raise ValueError('add and automapping must be booleans')
+        if right == 'calendar' and add and calendar_role not in CALENDAR_ROLES:
+            raise ValueError('calendar_role must be Reviewer, Author or Editor')
+        reference = next(iter(mailbox_reference(mailbox).values()))
         user_id = str(uuid.UUID(user_id))
-        return await read(tenant, 'get_mailbox', lambda t: exchange.run(t, 'get_mailbox', user_id), user_id)
+        user = await read(tenant, 'resolve_permission_user', lambda t: graph.request(t, f'users/{user_id}',
+            {'$select': 'id,displayName,userPrincipalName,accountEnabled'}), user_id)
+        target = await read(tenant, 'resolve_permission_mailbox', lambda t: exchange.run(t, 'get_mailbox', reference), reference)
+        address = str((target or {}).get('PrimarySmtpAddress') or '')
+        upn = str(user.get('userPrincipalName') or '')
+        if not address or not upn:
+            raise ValueError('Mailbox or user could not be resolved')
+        if target.get('ExternalDirectoryObjectId') == user_id:
+            raise ValueError('User already owns this mailbox')
+        payload = {'right': right, 'trustee': upn, 'trustee_id': user_id, 'add': add,
+                   'automapping': automapping if right == 'full_access' else False}
+        if right == 'calendar' and add:
+            payload['role'] = calendar_role
+        action = 'mailbox_permission'
+        plan = store.plan(actor.get()['name'], tenant, action, address, payload)
+        plan.update({'resolved_mailbox': target, 'resolved_user': user,
+                     'change': {'right': right, 'add': add, 'calendar_role': payload.get('role'), 'automapping': payload['automapping']}})
+        if right == 'full_access' and add:
+            plan['notice'] += ' Full access lets the user read all mail in this mailbox; it does not allow sending as the mailbox.'
+        store.audit(actor.get()['name'], tenant, action, address, 'planned')
+        return plan
 
     @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
     async def prepare_change(tenant: str, action: str, user_id: str) -> dict:
@@ -347,6 +388,8 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                 result = await graph.block(customer, target)
             elif action == 'convert_shared':
                 result = await exchange.run(customer, action, target)
+            elif action == 'mailbox_permission':
+                result = await exchange.run(customer, 'set_mailbox_permission', target, store.payload(plan_id))
             elif action in ('assign_licenses', 'revoke_sessions', 'add_group_member', 'remove_group_member'):
                 result = await graph.admin_change(customer, action, target, store.payload(plan_id))
             else:

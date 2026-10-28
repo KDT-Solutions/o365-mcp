@@ -9,7 +9,9 @@ import time
 
 from m365_mcp.certs import certificate_info, ensure_certificate
 from m365_mcp.core import Registry, Store, Tenant
-from m365_mcp.providers import Exchange
+import pytest
+
+from m365_mcp.providers import Exchange, mailbox_reference, validate_permission
 
 FAKE_PWSH = '''#!{python}
 import json, os, sys
@@ -120,3 +122,33 @@ def test_certificate_is_generated_once_with_private_permissions(tmp_path):
     assert info['pem'].startswith('-----BEGIN CERTIFICATE-----')
     assert 'PRIVATE' not in info['pem']
     assert len(info['thumbprint_sha1']) == 40
+
+
+def test_mailbox_reference_and_permission_validation():
+    assert mailbox_reference('00000000-0000-0000-0000-000000000005') == {'target': '00000000-0000-0000-0000-000000000005'}
+    assert mailbox_reference(' Info@Kunde.example ') == {'mailbox': 'info@kunde.example'}
+    for bad in ('info@kunde', 'a b@c.ch', '$(Remove-Mailbox)@x.ch', 'x' * 250 + '@a.ch'):
+        with pytest.raises(ValueError):
+            mailbox_reference(bad)
+    ok = validate_permission({'right': 'calendar', 'trustee': 'u@kunde.example', 'add': True, 'role': 'Reviewer', 'extra': 'ignored'})
+    assert ok == {'right': 'calendar', 'trustee': 'u@kunde.example', 'add': True, 'automapping': False, 'role': 'Reviewer'}
+    for bad in ({'right': 'calendar', 'trustee': 'u@kunde.example', 'add': True, 'role': 'Owner'},
+                {'right': 'full_access', 'trustee': 'u@kunde.example; x', 'add': True},
+                {'right': 'full_access', 'trustee': 'u@kunde.example', 'add': 'yes'}):
+        with pytest.raises(ValueError):
+            validate_permission(bad)
+
+
+def test_exchange_sends_mailbox_address_and_permission(tmp_path, monkeypatch):
+    exchange, log = fake_exchange(tmp_path, monkeypatch)
+
+    async def scenario():
+        result = await exchange.run(tenant('alpha', 2), 'set_mailbox_permission', 'jugend@alpha.example',
+                                    {'right': 'send_as', 'trustee': 'u@alpha.example', 'add': True})
+        for key in list(exchange.sessions):
+            await exchange.discard(key)
+        exchange.reaper.cancel()
+        return result
+
+    assert asyncio.run(scenario()) == [{'org': 'alpha.onmicrosoft.com'}]
+    assert 'call set_mailbox_permission' in log.read_text()

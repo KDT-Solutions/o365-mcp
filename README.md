@@ -19,7 +19,9 @@ Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft G
 | `list_user_teams` | Teams-Mitgliedschaften eines Benutzers |
 | `list_licenses` | Abonnierte Lizenz-SKUs und Verbrauch |
 | `list_mailboxes` | Erste maximal 100 Exchange-Postfächer |
-| `get_mailbox` | Einzelnes Postfach über Entra-Benutzerobjekt-ID |
+| `get_mailbox` | Einzelnes Postfach über Entra-Objekt-ID oder SMTP-Adresse (auch freigegebene Postfächer und Räume) |
+| `get_mailbox_permissions` | Vollzugriff, Senden-als und Berechtigungen des Standardkalenders eines Postfachs |
+| `prepare_mailbox_permission` | Plan zum Vergeben/Entfernen von Vollzugriff (mit Automapping), Senden-als oder Kalenderrecht (Reviewer, Author, Editor) |
 | `prepare_change` | Änderungsplan für `block_signin`, `revoke_sessions` oder `convert_shared` |
 | `prepare_license_change` | Plan zum Zuweisen/Entfernen direkter Benutzerlizenzen |
 | `prepare_group_membership` | Plan zum Hinzufügen/Entfernen eines Benutzers in einer statischen Cloud-Gruppe |

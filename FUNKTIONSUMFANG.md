@@ -8,7 +8,7 @@ Gewählt: App mit Zertifikat, mehrere freigegebene Kundentenants, Portainer Dock
 | Benutzer | Auflisten, Detailabfrage, Kontosperrung, Sitzungswiderruf | Anlage, Profiländerungen, Wiederherstellung, Lösch- und Passwortprozesse |
 | Lizenzen | Inventar, direkte Zuweisung/Entfernung über bestätigten Plan | Einzelne Servicepläne, gruppenbasierte Zuweisung und Standardpakete |
 | Gruppen | Inventar, Mitglieder lesen, statische Cloud-Mitgliedschaften ändern | Eigentümer, Gruppenanlage, dynamische und Exchange-verwaltete Gruppen |
-| Exchange | Postfächer lesen und in Shared Mailbox konvertieren | Weiterleitung, Delegationen, SendAs, Verteiler, Archiv, Retention und weitere gezielte Aktionen |
+| Exchange | Postfächer lesen und in Shared Mailbox konvertieren; Vollzugriff, Senden-als und Standardkalender-Berechtigungen lesen und ändern | Weiterleitung, Senden-im-Auftrag, weitere Kalenderordner, Verteiler, Archiv, Retention; Kalender von Microsoft-365-Gruppen |
 | Teams | Teams-Mitgliedschaften eines Benutzers lesen; Microsoft-365-Gruppenmitgliedschaft ändern | Teams-/Kanalverwaltung und Richtlinien |
 | Teams-Telefonie | Noch nicht implementiert | Calling Plan / Operator Connect / Direct Routing je Kunde klären; benötigte Cmdlets auf App-only-Unterstützung prüfen |
 | Onboarding | Einzelne Lizenz-/Gruppenaktionen vorhanden | Kundenstandard für Benutzeranlage, Lizenzpakete, Gruppen, Postfach und Telefonie; Ausführung mit Teilergebnisprotokoll |

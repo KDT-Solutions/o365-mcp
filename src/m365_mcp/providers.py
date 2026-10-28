@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import re
 import time
@@ -80,6 +81,13 @@ class Graph:
         # Never expose or fetch arbitrary continuation URLs supplied by callers.
         return {'items': data.get('value', []), 'more_available': '@odata.nextLink' in data,
                 'notice': 'Bounded first page. Narrow administrative queries before changing objects.'}
+
+    async def granted_roles(self, tenant):
+        """Application permissions (role names only) in the current access token for this tenant."""
+        token = await asyncio.to_thread(self.token, tenant)
+        payload = token.split('.')[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+        return sorted(str(role) for role in claims.get('roles', []))
 
     async def resolve_tenant(self, domain):
         """Look up the tenant ID of a verified customer domain via the public OpenID metadata. No credentials are sent."""

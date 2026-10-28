@@ -195,7 +195,12 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         store.update_tenant(tenant, organization=initial, status='active', display_name=organization.get('displayName'))
         registry.update(tenant, organization=initial, status='active')
         store.audit(client['name'], tenant, 'verify_tenant', current.tenant_id, 'succeeded', elapsed(started))
+        try:
+            roles = await graph.granted_roles(current)
+        except Exception:
+            roles = None
         return {'alias': tenant, 'verified': True, 'status': 'active', 'display_name': organization.get('displayName'),
+                'granted_graph_permissions': roles,
                 'organization': initial, 'exchange_notice': 'Mailbox tools additionally need an Exchange role for the enterprise application.'}
 
     @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})

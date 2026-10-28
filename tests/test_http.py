@@ -36,6 +36,9 @@ class FakeGraph:
         self.calls.append(('resolve', domain))
         return '00000000-0000-0000-0000-0000000000aa'
 
+    async def granted_roles(self, tenant):
+        return ['User.Read.All']
+
     async def organization(self, tenant):
         self.calls.append(('organization', tenant.alias))
         if not self.consented:

@@ -509,6 +509,55 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         store.audit(actor.get()['name'], tenant, action, user_id, 'planned')
         return result
 
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_auth_methods(tenant: str, user_id: str) -> dict:
+        """Read the registered sign-in/MFA methods of a user (type and id only, no phone numbers). Requires UserAuthenticationMethod.Read.All."""
+        user_id = str(uuid.UUID(user_id))
+        methods = await read(tenant, 'list_auth_methods', lambda t: graph.auth_methods(t, user_id), user_id)
+        return {'user_id': user_id, 'methods': methods}
+
+    async def credential_target(tenant, user_id, action):
+        user = await read(tenant, f'resolve_{action}_target', lambda t: graph.request(t, f'users/{user_id}',
+            {'$select': 'id,displayName,userPrincipalName,accountEnabled,onPremisesSyncEnabled,userType'}), user_id)
+        if user.get('onPremisesSyncEnabled'):
+            raise ValueError('User is synchronized from on-premises AD; reset the credential there')
+        if user.get('userType') == 'Guest':
+            raise ValueError('Guest users authenticate in their home tenant')
+        return user
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': True, 'openWorldHint': False})
+    async def prepare_password_reset(tenant: str, user_id: str, force_change: bool = True, revoke_sessions: bool = True) -> dict:
+        """Prepare a password reset for a cloud user. On execute_plan the server generates a random 16-character password and returns it once in the result; it is never stored or logged. force_change makes the user choose a new password at the next sign-in. revoke_sessions signs the user out everywhere. Requires User-PasswordProfile.ReadWrite.All and the Entra role User Administrator for the app. Confirm with execute_plan."""
+        authorize(tenant, write=True)
+        if type(force_change) is not bool or type(revoke_sessions) is not bool:
+            raise ValueError('force_change and revoke_sessions must be booleans')
+        user_id = str(uuid.UUID(user_id))
+        user = await credential_target(tenant, user_id, 'password_reset')
+        plan = store.plan(actor.get()['name'], tenant, 'reset_password', user_id,
+                          {'force_change': force_change, 'revoke_sessions': revoke_sessions})
+        plan.update({'resolved_user': user, 'force_change_next_sign_in': force_change, 'revoke_sessions': revoke_sessions,
+                     'warning': 'The current password stops working immediately. The new password appears only in the execute_plan result.'})
+        store.audit(actor.get()['name'], tenant, 'reset_password', user_id, 'planned')
+        return plan
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': True, 'openWorldHint': False})
+    async def prepare_mfa_reset(tenant: str, user_id: str, revoke_sessions: bool = True) -> dict:
+        """Prepare an MFA reset: on execute_plan all removable authentication methods of the user (Authenticator app, OATH token, phone, e-mail, FIDO2, Windows Hello, Temporary Access Pass) are deleted so the user registers again at the next sign-in, e.g. after a phone change. The password stays unchanged. Requires UserAuthenticationMethod.ReadWrite.All. Confirm with execute_plan."""
+        authorize(tenant, write=True)
+        if type(revoke_sessions) is not bool:
+            raise ValueError('revoke_sessions must be a boolean')
+        user_id = str(uuid.UUID(user_id))
+        user = await credential_target(tenant, user_id, 'mfa_reset')
+        methods = await read(tenant, 'resolve_mfa_methods', lambda t: graph.auth_methods(t, user_id), user_id)
+        removable = [m['type'] for m in methods if m['removable']]
+        plan = store.plan(actor.get()['name'], tenant, 'reset_mfa', user_id, {'revoke_sessions': revoke_sessions})
+        plan.update({'resolved_user': user, 'methods_to_delete': removable, 'revoke_sessions': revoke_sessions,
+                     'warning': 'If MFA is enforced, the user must be able to sign in with the password to register again.'})
+        if not removable:
+            plan['notice'] += ' No removable methods are registered; executing changes nothing except the optional session revocation.'
+        store.audit(actor.get()['name'], tenant, 'reset_mfa', user_id, 'planned')
+        return plan
+
     @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': True, 'idempotentHint': False})
     async def execute_plan(tenant: str, plan_id: str, confirmed: bool = False) -> dict:
         """Execute a reviewed plan once, only after explicit operator confirmation. confirmed must be true. On timeout/failure read remote state before preparing another plan."""
@@ -524,6 +573,10 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                 result = await graph.block(customer, target)
             elif action == 'convert_shared':
                 result = await exchange.run(customer, action, target)
+            elif action == 'reset_password':
+                result = await graph.reset_password(customer, target, store.payload(plan_id))
+            elif action == 'reset_mfa':
+                result = await graph.reset_mfa(customer, target, store.payload(plan_id))
             elif action == 'share_file':
                 result = await graph.share_file(customer, store.payload(plan_id))
             elif action == 'distribution_member':
@@ -538,8 +591,11 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
             store.finish(plan_id, 'unknown')
             store.audit(name, tenant, action, target, 'unknown_verify_remote_state', elapsed(started))
             raise RuntimeError('Execution did not complete cleanly. Plan is consumed. Check remote state before retrying.') from None
-        store.finish(plan_id, 'succeeded')
-        store.audit(name, tenant, action, target, 'succeeded', elapsed(started))
+        partial = action == 'reset_mfa' and (result.get('remaining_removable_methods') or
+                                             any(not m.get('deleted') for m in result.get('methods', [])))
+        outcome = 'partial' if partial else 'succeeded'
+        store.finish(plan_id, outcome)
+        store.audit(name, tenant, action, target, outcome, elapsed(started))
         return {'tenant': tenant, 'action': action, 'target': target, 'result': result}
 
     async def health(_):

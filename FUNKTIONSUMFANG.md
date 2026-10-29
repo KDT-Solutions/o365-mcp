@@ -5,7 +5,7 @@ Gewählt: App mit Zertifikat, mehrere freigegebene Kundentenants, Portainer Dock
 | Bereich | Implementiert | Noch erforderlich |
 |---|---|---|
 | Tenantzugriff | Kundenregister (fest oder per `add_tenant` zur Laufzeit), Consent-Link, `verify_tenant`, Bediener-ACL, Bearer-Authentifizierung | Freigabe eines zur Laufzeit angelegten Kunden für weitere Bediener; OAuth ergänzen, wenn der MCP-Client es benötigt |
-| Benutzer | Auflisten, Detailabfrage, Kontosperrung, Sitzungswiderruf | Anlage, Profiländerungen, Wiederherstellung, Lösch- und Passwortprozesse |
+| Benutzer | Auflisten, Detailabfrage, Kontosperrung, Sitzungswiderruf, Passwort-Reset, MFA-Methoden lesen und zurücksetzen | Anlage, Profiländerungen, Wiederherstellung, Löschprozesse |
 | Lizenzen | Inventar, direkte Zuweisung/Entfernung über bestätigten Plan | Einzelne Servicepläne, gruppenbasierte Zuweisung und Standardpakete |
 | Gruppen | Inventar, Mitglieder lesen, statische Cloud-Mitgliedschaften ändern | Eigentümer, Gruppenanlage, dynamische und Exchange-verwaltete Gruppen |
 | Exchange | Postfächer lesen und in Shared Mailbox konvertieren; Vollzugriff, Senden-als und Standardkalender-Berechtigungen lesen und ändern | Weiterleitung, Senden-im-Auftrag, weitere Kalenderordner, Verteiler, Archiv, Retention; Kalender von Microsoft-365-Gruppen |

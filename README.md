@@ -27,6 +27,9 @@ Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft G
 | `find_calendar_folders` | Kalenderordner nach Namen in allen Benutzer-, freigegebenen und Raumpostfächern suchen |
 | `prepare_mailbox_permission` | Plan zum Vergeben/Entfernen von Vollzugriff (mit Automapping), Senden-als oder Kalenderrecht (Reviewer, Author, Editor) |
 | `prepare_change` | Änderungsplan für `block_signin`, `revoke_sessions` oder `convert_shared` |
+| `list_auth_methods` | Registrierte Anmelde-/MFA-Methoden eines Benutzers (nur Typ und ID, keine Telefonnummern) |
+| `prepare_password_reset` | Plan für einen Passwort-Reset; das neue Zufallspasswort (16 Zeichen) wird erst bei `execute_plan` erzeugt, einmal ausgegeben und nie gespeichert |
+| `prepare_mfa_reset` | Plan, alle löschbaren MFA-Methoden zu entfernen (z.B. nach Handywechsel); der Benutzer registriert sich bei der nächsten Anmeldung neu |
 | `prepare_license_change` | Plan zum Zuweisen/Entfernen direkter Benutzerlizenzen |
 | `prepare_distribution_membership` | Plan zum Hinzufügen/Entfernen eines Benutzers in einer Cloud-Verteilerliste (über Exchange) |
 | `prepare_group_membership` | Plan zum Hinzufügen/Entfernen eines Benutzers in einer statischen Cloud-Gruppe |
@@ -34,6 +37,8 @@ Erste implementierte Version eines tenantgetrennten MCP-Servers für Microsoft G
 | `get_audit_log` | Audit-Log der freigegebenen Tenants, neueste zuerst; Filter nach Tenant, Aktion, Stunden |
 | `get_app_certificate` | Öffentliches App-Zertifikat (PEM, SHA-1-Fingerabdruck, Gültigkeit) für den Upload in Entra |
 | `get_version` | Version und Build-Commit |
+
+Passwort- und MFA-Reset sind nur für Cloud-Benutzer möglich (keine synchronisierten Konten, keine Gäste). Passwörter von Administratorkonten kann die Rolle User Administrator nur eingeschränkt zurücksetzen (Microsoft-Doku „Who can reset passwords“). Das neue Passwort steht ausschließlich im Ergebnis von `execute_plan`; es wird weder im Plan noch im Audit-Log gespeichert. Beim MFA-Reset wird jede Methode einzeln gelöscht und im Ergebnis ausgewiesen; schlägt eine fehl, steht der Plan im Audit-Log auf `partial`.
 
 Keine Benutzeranlage/-löschung, vollständige On-/Offboarding-Automatik, Teams-Telefonie oder frei ausführbaren Graph-/PowerShell-Kommandos. Lizenzänderungen beziehen sich auf direkte Benutzerlizenzen. Neu zugewiesene SKUs aktivieren alle Servicepläne; gruppenbasierte Lizenzen werden nicht entfernt. Dynamische, synchronisierte, rollenfähige und Exchange-verwaltete Gruppen sind für Mitgliedschaftsänderungen ausgeschlossen. `block_signin` sperrt zukünftige Anmeldungen; es widerruft keine bestehenden Sitzungen. Große Inventare werden ausdrücklich als begrenzte erste Seite ausgewiesen; diese Version implementiert keinen vollständigen Export.
 
@@ -57,6 +62,8 @@ Schreibzugriff ist in der Beispielkonfiguration abgeschaltet. Für den ersten Te
 | Teams-Mitgliedschaften lesen, optional | `Team.ReadBasic.All` |
 | OneDrive-Dateien suchen und teilen, optional | `Files.ReadWrite.All` (Zugriff auf alle Dateien des Tenants) |
 | Sitzungen widerrufen, optional | `User.RevokeSessions.All` |
+| Passwort zurücksetzen, optional | `User-PasswordProfile.ReadWrite.All` **und** beim Kunden die Entra-Rolle **User Administrator** (Benutzeradministrator) für die Enterprise-App |
+| MFA-Methoden lesen/zurücksetzen, optional | `UserAuthenticationMethod.ReadWrite.All` (nur lesen: `UserAuthenticationMethod.Read.All`) |
 
 Nur benötigte Rechte konfigurieren. Änderungen an privilegierten Administratorkonten unterliegen zusätzlichen Microsoft-Einschränkungen; ein erfolgreiches Consent bedeutet nicht, dass jede Kontosperrung zulässig ist.
 

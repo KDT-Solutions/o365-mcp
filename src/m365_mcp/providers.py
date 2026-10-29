@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import re
+import secrets
 import time
 import uuid
 from pathlib import Path
@@ -27,6 +28,29 @@ def mailbox_reference(value):
     if len(value) > 254 or not EMAIL.fullmatch(value):
         raise ValueError('Mailbox must be an Entra object UUID or an SMTP address')
     return {'mailbox': value.lower()}
+
+
+# Graph sub-collection per authentication method type. Password methods cannot be deleted and are left out.
+AUTH_METHOD_PATHS = {
+    'microsoftAuthenticatorAuthenticationMethod': 'microsoftAuthenticatorMethods',
+    'softwareOathAuthenticationMethod': 'softwareOathMethods',
+    'phoneAuthenticationMethod': 'phoneMethods',
+    'emailAuthenticationMethod': 'emailMethods',
+    'fido2AuthenticationMethod': 'fido2Methods',
+    'temporaryAccessPassAuthenticationMethod': 'temporaryAccessPassMethods',
+    'windowsHelloForBusinessAuthenticationMethod': 'windowsHelloForBusinessMethods',
+    'platformCredentialAuthenticationMethod': 'platformCredentialMethods',
+}
+# No look-alike characters (0/O, 1/l/I) and only symbols that survive SMS and phone dictation.
+PASSWORD_GROUPS = ('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnpqrstuvwxyz', '23456789', '!#%+-=?')
+
+
+def generate_password(length=16):
+    alphabet = ''.join(PASSWORD_GROUPS)
+    chars = [secrets.choice(group) for group in PASSWORD_GROUPS]
+    chars += [secrets.choice(alphabet) for _ in range(length - len(chars))]
+    secrets.SystemRandom().shuffle(chars)
+    return ''.join(chars)
 
 
 DOMAIN = re.compile(r'(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}')
@@ -152,6 +176,63 @@ class Graph:
         result = await self.request(tenant, f'users/{owner}/drive/items/{item_id}/invite', method='POST', body={
             'recipients': [{'email': recipient}], 'requireSignIn': True, 'sendInvitation': False, 'roles': [role]})
         return {'shared_with': recipient, 'role': role, 'permissions': len(result.get('value', []))}
+
+    async def auth_methods(self, tenant, user_id):
+        """Registered authentication methods of a user as type and id only (no phone numbers or device details)."""
+        user_id = str(uuid.UUID(user_id))
+        data = await self.request(tenant, f'users/{user_id}/authentication/methods')
+        methods = []
+        for item in data.get('value', []):
+            kind = str(item.get('@odata.type', '')).removeprefix('#microsoft.graph.')
+            methods.append({'type': kind, 'id': item.get('id'), 'removable': kind in AUTH_METHOD_PATHS,
+                            'label': item.get('displayName') or item.get('phoneType') or None})
+        return methods
+
+    async def reset_password(self, tenant, user_id, payload):
+        """Set a new random password. It is generated here, returned once and never stored or logged."""
+        user_id = str(uuid.UUID(user_id))
+        force = payload.get('force_change')
+        if type(force) is not bool:
+            raise ValueError('Invalid password reset request')
+        password = generate_password()
+        await self.request(tenant, f'users/{user_id}', body={'passwordProfile': {
+            'forceChangePasswordNextSignIn': force, 'password': password}})
+        result = {'temporary_password': password, 'force_change_next_sign_in': force,
+                  'notice': 'Shown once, not stored. Hand it over through a separate channel.'}
+        if payload.get('revoke_sessions') is True:
+            result['sessions_revoked'] = await self.revoke_quietly(tenant, user_id)
+        return result
+
+    async def reset_mfa(self, tenant, user_id, payload):
+        """Delete all removable authentication methods so the user registers MFA again at the next sign-in.
+        Each method is reported separately; a failure does not stop the others."""
+        user_id = str(uuid.UUID(user_id))
+        methods = [m for m in await self.auth_methods(tenant, user_id) if m['removable']]
+        # Phone methods last: Entra refuses to delete the default method while others still exist.
+        methods.sort(key=lambda m: m['type'] == 'phoneAuthenticationMethod')
+        results = []
+        for method in methods:
+            if not re.fullmatch(r'[A-Za-z0-9_=+/-]{1,128}', str(method['id'])):
+                results.append({'type': method['type'], 'deleted': False, 'error': 'invalid id'})
+                continue
+            try:
+                await self.request(tenant, f"users/{user_id}/authentication/{AUTH_METHOD_PATHS[method['type']]}/{method['id']}", method='DELETE')
+                results.append({'type': method['type'], 'deleted': True})
+            except RuntimeError as error:
+                results.append({'type': method['type'], 'deleted': False, 'error': str(error)})
+        remaining = [m['type'] for m in await self.auth_methods(tenant, user_id) if m['removable']]
+        result = {'methods': results, 'remaining_removable_methods': remaining,
+                  'notice': 'The user registers MFA again at the next sign-in where MFA is required.'}
+        if payload.get('revoke_sessions') is True:
+            result['sessions_revoked'] = await self.revoke_quietly(tenant, user_id)
+        return result
+
+    async def revoke_quietly(self, tenant, user_id):
+        try:
+            await self.request(tenant, f'users/{user_id}/revokeSignInSessions', body={}, method='POST')
+            return True
+        except RuntimeError as error:
+            return str(error)
 
     async def block(self, tenant, target):
         target = str(uuid.UUID(target))

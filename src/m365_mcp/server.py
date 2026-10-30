@@ -17,6 +17,7 @@ import uvicorn
 
 from .certs import certificate_info, ensure_certificate
 from .core import ALIAS, Registry, Store, Tenant
+from . import security
 from .providers import ExchangeError, CALENDAR_ROLES, MAILBOX_RIGHTS, Exchange, Graph, mailbox_reference, validate_folder
 
 actor = contextvars.ContextVar('actor')
@@ -558,6 +559,70 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
         store.audit(actor.get()['name'], tenant, 'reset_mfa', user_id, 'planned')
         return plan
 
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_sign_ins(tenant: str, user_id: str, hours: int = 168, interactive: bool = True,
+                            failures_only: bool = False, limit: int = 300) -> dict:
+        """Read the Entra sign-in log of one user (newest first) with a summary of IP addresses, countries, failures and risky sign-ins. interactive=false reads the non-interactive sign-ins (token refreshes of Outlook, Teams, OneDrive etc.), where stolen tokens show up. hours 1-720 (Microsoft keeps 30 days with Entra ID P1/P2, 7 days without), limit 1-1000. Error 53011 means the user is blocked in another tenant because of risk in this home tenant. Requires AuditLog.Read.All and Directory.Read.All."""
+        if type(interactive) is not bool or type(failures_only) is not bool:
+            raise ValueError('interactive and failures_only must be booleans')
+        user_id = str(uuid.UUID(user_id))
+        return await read(tenant, 'list_sign_ins', lambda t: security.sign_ins(graph, t, user_id, hours, interactive, failures_only, limit), user_id)
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_directory_audits(tenant: str, user_id: str | None = None, hours: int = 168, limit: int = 200) -> dict:
+        """Read the Entra audit log (newest first): changes to users, MFA methods, passwords, roles, apps, groups. user_id limits it to changes targeting that user. hours 1-720, limit 1-1000. Requires AuditLog.Read.All."""
+        user_id = str(uuid.UUID(user_id)) if user_id else None
+        return await read(tenant, 'list_directory_audits', lambda t: security.directory_audits(graph, t, user_id, hours, limit), user_id or '')
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_risky_users(tenant: str, at_risk_only: bool = True, limit: int = 200) -> dict:
+        """Read Identity Protection risky users (at risk or confirmed compromised by default; at_risk_only=false includes remediated and dismissed). Without Entra ID P2 risk levels and details are hidden. Requires IdentityRiskyUser.Read.All."""
+        if type(at_risk_only) is not bool:
+            raise ValueError('at_risk_only must be a boolean')
+        return await read(tenant, 'list_risky_users', lambda t: security.risky_users(graph, t, at_risk_only, limit))
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def get_user_risk(tenant: str, user_id: str) -> dict:
+        """Read the Identity Protection risk state and risk history of one user. Requires IdentityRiskyUser.Read.All."""
+        user_id = str(uuid.UUID(user_id))
+        return await read(tenant, 'get_user_risk', lambda t: security.risky_user(graph, t, user_id), user_id)
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_risk_detections(tenant: str, user_id: str | None = None, hours: int = 720, limit: int = 200) -> dict:
+        """Read Identity Protection risk detections (e.g. leaked credentials, anonymous IP, impossible travel, unfamiliar sign-in properties), optionally for one user. hours 1-720. Full details need Entra ID P2. Requires IdentityRiskEvent.Read.All."""
+        user_id = str(uuid.UUID(user_id)) if user_id else None
+        return await read(tenant, 'list_risk_detections', lambda t: security.risk_detections(graph, t, user_id, hours, limit), user_id or '')
+
+    @mcp.tool(annotations={'readOnlyHint': True})
+    async def list_inbox_rules(tenant: str, user_id: str) -> dict:
+        """Read the inbox rules of a mailbox and flag rules that forward, redirect or delete mail (typical after an account takeover). Also shows the automatic reply status. Requires MailboxSettings.Read."""
+        user_id = str(uuid.UUID(user_id))
+
+        async def both(t):
+            rules = await security.inbox_rules(graph, t, user_id)
+            rules['mailbox_settings'] = await security.mailbox_forwarding(graph, t, user_id)
+            return rules
+        return await read(tenant, 'list_inbox_rules', both, user_id)
+
+    @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False})
+    async def prepare_risk_action(tenant: str, user_id: str, action: str) -> dict:
+        """Prepare an Identity Protection action for a user: dismiss_risk (risk was a false positive; lifts blocks by risk policies, also in other tenants for B2B guests) or confirm_compromised (sets user risk to high). A password reset also clears user risk. Requires IdentityRiskyUser.ReadWrite.All. Confirm with execute_plan."""
+        authorize(tenant, write=True)
+        if action not in security.RISK_ACTIONS:
+            raise ValueError('action must be dismiss_risk or confirm_compromised')
+        user_id = str(uuid.UUID(user_id))
+        user = await read(tenant, 'resolve_risk_target', lambda t: graph.request(t, f'users/{user_id}',
+            {'$select': 'id,displayName,userPrincipalName,accountEnabled'}), user_id)
+        risk = await read(tenant, 'resolve_user_risk', lambda t: security.risky_user(graph, t, user_id), user_id)
+        plan = store.plan(actor.get()['name'], tenant, action, user_id)
+        plan.update({'resolved_user': user, 'current_risk': risk.get('current'), 'risk_listed': risk.get('listed')})
+        if action == 'dismiss_risk' and not risk.get('listed'):
+            plan['warning'] = 'User has no risk record in this tenant; dismissing may change nothing. Consider a password reset.'
+        if action == 'confirm_compromised':
+            plan['warning'] = 'Sets the user risk to high; risk-based policies (also in other tenants) will block or force a password change.'
+        store.audit(actor.get()['name'], tenant, action, user_id, 'planned')
+        return plan
+
     @mcp.tool(annotations={'readOnlyHint': False, 'destructiveHint': True, 'idempotentHint': False})
     async def execute_plan(tenant: str, plan_id: str, confirmed: bool = False) -> dict:
         """Execute a reviewed plan once, only after explicit operator confirmation. confirmed must be true. On timeout/failure read remote state before preparing another plan."""
@@ -579,6 +644,8 @@ def create_app(config_path=None, state_path=None, graph=None, exchange=None):
                 result = await graph.reset_mfa(customer, target, store.payload(plan_id))
             elif action == 'share_file':
                 result = await graph.share_file(customer, store.payload(plan_id))
+            elif action in security.RISK_ACTIONS:
+                result = await security.risk_action(graph, customer, action, target)
             elif action == 'distribution_member':
                 result = await exchange.run(customer, 'set_distribution_member', target, store.payload(plan_id))
             elif action == 'mailbox_permission':

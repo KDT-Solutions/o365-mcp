@@ -64,6 +64,10 @@ Schreibzugriff ist in der Beispielkonfiguration abgeschaltet. Für den ersten Te
 | Sitzungen widerrufen, optional | `User.RevokeSessions.All` |
 | Passwort zurücksetzen, optional | `User-PasswordProfile.ReadWrite.All` **und** beim Kunden die Entra-Rolle **User Administrator** (Benutzeradministrator) für die Enterprise-App |
 | MFA-Methoden lesen/zurücksetzen, optional | `UserAuthenticationMethod.ReadWrite.All` (nur lesen: `UserAuthenticationMethod.Read.All`) |
+| Anmelde- und Überwachungsprotokolle lesen (`list_sign_ins`, `list_directory_audits`), optional | `AuditLog.Read.All` und `Directory.Read.All`; Anmeldeprotokolle 30 Tage nur mit Entra ID P1/P2 beim Kunden |
+| Riskante Benutzer und Risikoerkennungen lesen (`list_risky_users`, `get_user_risk`, `list_risk_detections`), optional | `IdentityRiskyUser.Read.All`, `IdentityRiskEvent.Read.All`; ohne Entra ID P2 blendet Microsoft Risikodetails aus |
+| Benutzerrisiko verwerfen oder Kompromittierung bestätigen (`prepare_risk_action`), optional | `IdentityRiskyUser.ReadWrite.All` |
+| Posteingangsregeln lesen (`list_inbox_rules`), optional | `MailboxSettings.Read` (funktioniert ohne Exchange-Rolle) |
 
 Nur benötigte Rechte konfigurieren. Änderungen an privilegierten Administratorkonten unterliegen zusätzlichen Microsoft-Einschränkungen; ein erfolgreiches Consent bedeutet nicht, dass jede Kontosperrung zulässig ist.
 

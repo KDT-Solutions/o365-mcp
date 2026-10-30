@@ -85,12 +85,15 @@ class Graph:
             raise RuntimeError('Microsoft authentication failed; check tenant consent and certificate')
         return result['access_token']
 
-    async def request(self, tenant, path, params=None, body=None, method=None):
+    async def request(self, tenant, path, params=None, body=None, method=None, api='v1.0'):
+        # beta only for reads Microsoft offers nowhere else (non-interactive sign-ins).
+        if api not in ('v1.0', 'beta'):
+            raise ValueError('Unsupported Graph API version')
         token = await asyncio.to_thread(self.token, tenant)
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             for attempt in range(4):
                 response = await client.request(method or ('PATCH' if body is not None else 'GET'),
-                    'https://graph.microsoft.com/v1.0/' + path,
+                    f'https://graph.microsoft.com/{api}/' + path,
                     headers={'Authorization': 'Bearer ' + token}, params=params, json=body)
                 if response.status_code in (429, 502, 503, 504) and attempt < 3:
                     delay = response.headers.get('Retry-After', '')
@@ -100,12 +103,21 @@ class Graph:
                     raise RuntimeError(f'Graph HTTP {response.status_code}; request-id={response.headers.get("request-id", "unknown")}')
                 return response.json() if response.content else {'success': True}
 
-    async def request_link(self, tenant, link):
+    async def request_link(self, tenant, link, api='v1.0'):
         """Follow a Graph paging link (@odata.nextLink) returned by Graph itself; any other host or API version is refused."""
-        prefix = 'https://graph.microsoft.com/v1.0/'
-        if not isinstance(link, str) or not link.startswith(prefix):
+        prefix = f'https://graph.microsoft.com/{api}/'
+        if api not in ('v1.0', 'beta') or not isinstance(link, str) or not link.startswith(prefix):
             raise ValueError('Unexpected paging link')
-        return await self.request(tenant, link[len(prefix):])
+        return await self.request(tenant, link[len(prefix):], api=api)
+
+    async def collect(self, tenant, path, params, limit, api='v1.0'):
+        """Follow Graph's own paging links until limit items are collected."""
+        data = await self.request(tenant, path, params, api=api)
+        items = list(data.get('value', []))
+        while '@odata.nextLink' in data and len(items) < limit:
+            data = await self.request_link(tenant, data['@odata.nextLink'], api=api)
+            items.extend(data.get('value', []))
+        return items[:limit], len(items) > limit or '@odata.nextLink' in data
 
     async def drive_inventory(self, tenant, user_id, max_items=50000):
         """All items of a user's OneDrive as a flat list via the delta query (works with app-only access)."""
